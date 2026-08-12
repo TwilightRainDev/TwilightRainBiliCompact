@@ -939,6 +939,7 @@ if (typeof module !== 'undefined' && module.exports) {
                 ClearEmoticons: '清除评论全部表情',
                 ReplaceSearchTerms: '搜索跳转词转普通文本',
                 PurifierSectionHint: '规则保存后立即对已加载评论生效',
+                PurifierTutorial: '用法：模糊词与正则每行一条，命中即整条评论隐藏；正则写错自动跳过（控制台提示）。替换规则 关键词=>替换词；表情替换留空=删除图片。示例正则：\\d{8,} 屏蔽超长数字评论。',
                 PanelLanguage: '界面语言 / Language',
                 PanelLanguageAuto: '自动 (Auto)',
                 PanelBtnPause: '暂停精简',
@@ -1025,6 +1026,7 @@ if (typeof module !== 'undefined' && module.exports) {
                 ClearEmoticons: '清除評論全部表情',
                 ReplaceSearchTerms: '搜尋跳轉詞轉普通文字',
                 PurifierSectionHint: '規則儲存後立即對已載入評論生效',
+                PurifierTutorial: '用法：模糊詞與正則每行一條，命中即整條評論隱藏；正則寫錯自動跳過（主控台提示）。替換規則 關鍵詞=>替換詞；表情替換留空=刪除圖片。範例正則：\\d{8,} 屏蔽超長數字評論。',
                 PanelLanguage: '介面語言 / Language',
                 PanelLanguageAuto: '自動 (Auto)',
                 PanelBtnPause: '暫停精簡',
@@ -1111,6 +1113,7 @@ if (typeof module !== 'undefined' && module.exports) {
                 ClearEmoticons: 'Clear all emoticons',
                 ReplaceSearchTerms: 'Search terms → plain text',
                 PurifierSectionHint: 'Rules apply to loaded comments after save',
+                PurifierTutorial: 'Usage: fuzzy words and regexes are one per line; a match hides the whole comment. Invalid regexes are skipped with a console warning. Replacement: keyword=>replacement; emoticon replacement empty = delete image. Example regex: \\d{8,} hides comments with long digit runs.',
                 PanelLanguage: 'Language / 語言',
                 PanelLanguageAuto: 'Auto',
                 PanelBtnPause: 'Pause',
@@ -1197,6 +1200,7 @@ if (typeof module !== 'undefined' && module.exports) {
                 ClearEmoticons: 'コメントの絵文字を全削除',
                 ReplaceSearchTerms: '検索リンクを通常テキスト化',
                 PurifierSectionHint: '保存後、読み込み済みコメントへ即時反映',
+                PurifierTutorial: '使い方: キーワードと正規表現は1行1件、一致するとコメント全体を非表示にします。不正な正規表現はスキップされコンソールに警告が出ます。置換: 語=>置換語; 絵文字置換の空欄は画像削除。例: \\d{8,} は長い数字列を非表示にします。',
                 PanelLanguage: '言語 / Language',
                 PanelLanguageAuto: '自動 (Auto)',
                 PanelBtnPause: '一時停止',
@@ -2334,6 +2338,7 @@ if (typeof module !== 'undefined' && module.exports) {
                     <label>${T('ClearEmoticons')} <input type="checkbox" id="CfgClearEmoticons" ${Config.ClearCommentEmoticons ? 'checked' : ''}></label>
                     <label>${T('ReplaceSearchTerms')} <input type="checkbox" id="CfgReplaceSearchTerms" ${Config.ReplaceCommentSearchTerms ? 'checked' : ''}></label>
                     <div class="bc-hint">${T('PurifierSectionHint')}</div>
+                    <div class="bc-hint" style="padding:6px 8px;border:1px dashed var(--border-light);border-radius:6px">${T('PurifierTutorial')}</div>
                 </div>
                 <hr style="margin:8px 0;border:none;border-top:1px solid var(--hr, #333)">
                 <div class="bc-collapse-header" id="CfgCollapseRm">
