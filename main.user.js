@@ -6,10 +6,10 @@
 // @namespace    http://tampermonkey.net/
 // @version      2.8.0
 // @license MIT
-// @description  Are you tired of the overwhelming number of videos on Bilibili's web interface? Want a more streamlined interface? This plugin helps you display only a specified number of videos, with support for multiple pages, black/whitelists, and persistent configuration. Its non‑intrusive design injects no UI elements into Bilibili pages. Supports Simplified Chinese, Traditional Chinese, English, and Japanese. Also includes local renaming of videos in the favorites page, with pure display‑layer replacement and zero network requests.
-// @description:zh-CN   你是否厌倦了网页端极多视频？想要更简要的界面？这个插件将帮助你只显示指定数量的视频，支持多种页面、黑/白名单、配置持久化。非侵入式设计，不在页面注入任何UI元素。支持简中，繁中，英语，日语。另含收藏夹页视频本地重命名，纯显示层替换，零网络请求。
-// @description:zh-TW   你是否厭倦了網頁端極多影片？想要更簡要的介面？這個外掛將幫助你只顯示指定數量的影片，支援多種頁面、黑/白名單、設定持久化。非侵入式設計，不在頁面注入任何 UI 元素。支援簡中、繁中、英語、日語。另含收藏夾頁影片本地重新命名，純顯示層替換，零網路請求。
-// @description:ja     ビリビリのウェブ版では、動画が多すぎてうんざりしていませんか？もっとシンプルで見やすいインターフェースが欲しいと思いませんか？このプラグインは、表示する動画数を指定した件数に制限するお手伝いをします。複数 ページ への対応や、ホワイトリスト／ブラックリストの設定、そして設定内容の保存も可能です。また、ビリビリのページに一切の ユーザー インターフェース要素を追加しない、非侵襲的な設計を採用しています。対応言語は、簡体中文、繁体中文、英語、日本語です。さらに、お気に入りページの動画をローカルでリネームする機能も搭載しています。表示レイヤーのみを置き換える純粋な処理のため、ネットワークリクエストは一切発生しません。
+// @description  Tired of Bilibili's cluttered video feed? This plugin limits visible videos per page, supports multi‑page, black/whitelists, and persistent settings. No UI injected, 4 languages supported. Locally, there are 0 network requests.
+// @description:zh-CN   厌倦网页视频过多？本插件限制显示数量，支持多页、黑白名单、持久配置。无UI注入，四语言。收藏夹本地重命名，零网络请求。
+// @description:zh-TW   厭倦網頁影片過多？本外掛限制顯示數量，支援多頁、黑白名單、持久設定。無UI注入，四語言。收藏夾本地重新命名，零網路請求。
+// @description:ja     ビリビリの動画過多？本プラグインは表示制限、多ページ・黑白リスト・設定永続化。UI追加なし、四つの言語。お気に入りローカルリネーム、通信ゼロ。
 // @author       TwilightRainDev
 // @match        https://www.bilibili.com/
 // @match        https://www.bilibili.com/?*
