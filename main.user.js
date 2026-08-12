@@ -4,7 +4,7 @@
 // @name:zh-TW   網頁端Bilibili主頁精簡~ BiliCompact
 // @name:ja      Web版Bilibiliのhomepageの簡素化
 // @namespace    http://tampermonkey.net/
-// @version      2.8.0
+// @version      2.9.1
 // @license MIT
 // @description  Tired of Bilibili's cluttered video feed? This plugin limits visible videos per page, supports multi‑page, black/whitelists, and persistent settings. No UI injected, 4 languages supported. Locally, there are 0 network requests.
 // @description:zh-CN   厌倦网页视频过多？本插件限制显示数量，支持多页、黑白名单、持久配置。无UI注入，四语言。收藏夹本地重命名，零网络请求。
@@ -44,10 +44,218 @@
 // @icon         https://www.bilibili.com/favicon.ico
 // @downloadURL https://update.greasyfork.org/scripts/585777/%E7%BD%91%E9%A1%B5%E7%AB%AFB%E7%AB%99%E4%B8%BB%E9%A1%B5%E7%B2%BE%E7%AE%80~%20BiliCompact.user.js
 // @updateURL https://update.greasyfork.org/scripts/585777/%E7%BD%91%E9%A1%B5%E7%AB%AFB%E7%AB%99%E4%B8%BB%E9%A1%B5%E7%B2%BE%E7%AE%80~%20BiliCompact.meta.js
+// PS; 根据 哔哩哔哩屏蔽增强器のApache-2.0声明，针对其进行优化适配，已继承其评论屏蔽（关键词/正则）与评论内容替换功能。尊重原始作者byhgz的版权。
 // ==/UserScript==
+
+// ======================== 评论规则引擎（纯函数，零 DOM/GM 依赖，node 可测） ========================
+// 继承自 哔哩哔哩屏蔽增强器 (byhgz, Apache-2.0) 的评论匹配语义：
+//   模糊: value.toLowerCase().includes(item)（大小写不敏感子串）
+//   正则: value 去全部空白后 search(规则)，单条异常跳过并记日志
+//   关键词替换: includes(find) 且 scope 匹配 → replaceAll
+//   表情替换: img alt 全等匹配，replace 为空 = 删除
+var CommentRuleEngine = (function() {
+    'use strict';
+    function fuzzyMatch(ruleList, value) {
+        if (!Array.isArray(ruleList) || ruleList.length === 0 || value == null) return null;
+        var Lowered = String(value).toLowerCase();
+        for (var i = 0; i < ruleList.length; i++) {
+            // 规则词与评论内容双向忽略大小写（Blocker 原版仅对 value 小写化，
+            // 这里放宽为对规则词也小写，避免用户输入大写词时永不命中）
+            if (Lowered.indexOf(String(ruleList[i]).toLowerCase()) !== -1) return ruleList[i];
+        }
+        return null;
+    }
+    function regexMatch(ruleList, value) {
+        if (!Array.isArray(ruleList) || ruleList.length === 0) return { hit: null, error: null };
+        var Cleaned = String(value).split(/[\t\r\f\n\s]*/g).join('');
+        for (var i = 0; i < ruleList.length; i++) {
+            try {
+                if (Cleaned.search(ruleList[i]) !== -1) return { hit: ruleList[i], error: null };
+            } catch (E) {
+                // 单条正则错误：跳过，不中断其他规则（对齐 Blocker 的 try/catch 语义）
+                if (typeof console !== 'undefined') console.warn('[BiliCompact] 正则规则异常，已跳过: ' + ruleList[i], E);
+            }
+        }
+        return { hit: null, error: null };
+    }
+    function blockComment(content, fuzzyList, regexList) {
+        if (!content) return { state: false };
+        var Hit = fuzzyMatch(fuzzyList || [], content);
+        if (Hit !== null) return { state: true, type: '模糊评论', matching: Hit };
+        var R = regexMatch(regexList || [], content);
+        if (R.hit !== null) return { state: true, type: '正则评论', matching: R.hit };
+        return { state: false };
+    }
+    function replaceKeywords(arr, content, scope) {
+        if (!Array.isArray(arr) || arr.length === 0 || !content) return { state: false };
+        for (var i = 0; i < arr.length; i++) {
+            var V = arr[i];
+            if (!V || !V.find || content.indexOf(V.find) === -1) continue;
+            if (!V.scopes || V.scopes.indexOf(scope) === -1) continue;
+            return { state: true, content: content.split(V.find).join(V.replace || '') };
+        }
+        return { state: false };
+    }
+    function replaceEmoticons(arr, alt) {
+        if (!Array.isArray(arr) || arr.length === 0 || !alt) return { state: false };
+        for (var i = 0; i < arr.length; i++) {
+            var V = arr[i];
+            if (!V || V.find !== alt) continue;
+            if (V.replace === '') return { state: true, model: 'del', content: alt };
+            return { state: true, model: 'subStr', content: V.replace };
+        }
+        return { state: false };
+    }
+    return { fuzzyMatch: fuzzyMatch, regexMatch: regexMatch, blockComment: blockComment, replaceKeywords: replaceKeywords, replaceEmoticons: replaceEmoticons };
+})();
+
+// ======================== 共享面板主题（两模块统一，面板元素打 data-bc-theme 属性） ========================
+// 主题变量与基础控件样式唯一来源：信息流精简面板（BiliCompactPanel）与
+// 收藏夹重命名面板（favrename-panel/settings）共用；布局专属样式留在各模块内。
+var PANEL_THEME_CSS = `
+[data-bc-theme] {
+    --bg: #1e1e1e;
+    --text: #eee;
+    --text-secondary: #ccc;
+    --text-heading: #fff;
+    --input-bg: #2a2a2a;
+    --border: #333;
+    --border-light: #444;
+    --hr: #333;
+    --accent: #fb7299;
+    --accent-hover: #ff85a8;
+    --badge-off: #666;
+    --btn-secondary-bg: #444;
+    --btn-secondary-hover: #555;
+    --btn-secondary-text: #fff;
+    --danger: #f25d8e;
+    --danger-hover: #4a2430;
+    --collapse-hover: #333;
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 16px;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+    font-size: 13px; line-height: 1.6;
+}
+[data-bc-theme].light-mode {
+    --bg: #ffffff;
+    --text: #333;
+    --text-secondary: #555;
+    --text-heading: #111;
+    --input-bg: #f5f5f5;
+    --border: #ddd;
+    --border-light: #e0e0e0;
+    --hr: #eee;
+    --accent: #00AEEC;
+    --accent-hover: #33c0f0;
+    --badge-off: #bbb;
+    --btn-secondary-bg: #eee;
+    --btn-secondary-hover: #ddd;
+    --btn-secondary-text: #333;
+    --danger: #f25d8e;
+    --danger-hover: #fff1f5;
+    --collapse-hover: #eee;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.12);
+}
+[data-bc-theme] button.bc-btn {
+    border: none; background: var(--btn-secondary-bg); color: var(--btn-secondary-text);
+    border-radius: 20px; padding: 3px 14px; cursor: pointer; font-size: 12px; white-space: nowrap;
+}
+[data-bc-theme] button.bc-btn:hover { background: var(--btn-secondary-hover); }
+[data-bc-theme] button.bc-btn-accent { background: var(--accent); color: #fff; }
+[data-bc-theme] button.bc-btn-accent:hover { background: var(--accent-hover); }
+[data-bc-theme] button.bc-btn-danger { color: var(--danger); background: transparent; border: 1px solid var(--danger); }
+[data-bc-theme] button.bc-btn-danger:hover { background: var(--danger-hover); color: var(--danger); }
+[data-bc-theme] input.bc-input {
+    background: var(--input-bg); color: var(--text);
+    border: 1px solid var(--border-light); border-radius: 6px; padding: 4px 8px;
+    font-size: 12px; font-family: inherit;
+}
+[data-bc-theme] input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
+[data-bc-theme] .bc-hint { font-size: 12px; color: #888; line-height: 1.4; }
+[data-bc-theme] .bc-collapse-header {
+    display: flex; align-items: center; gap: 6px; cursor: pointer;
+    padding: 6px 8px; border-radius: 6px; user-select: none;
+    font-size: 13px; color: var(--accent); font-weight: 500; transition: background 0.15s;
+}
+[data-bc-theme] .bc-collapse-header:hover { background: var(--collapse-hover); }
+[data-bc-theme] .bc-collapse-arrow { transition: transform 0.2s; font-size: 12px; line-height: 1; }
+[data-bc-theme] .bc-collapse-arrow.open { transform: rotate(90deg); }
+[data-bc-theme] .bc-collapse-content { display: flex; flex-direction: column; gap: 8px; }
+[data-bc-theme] .bc-collapse-content.collapsed { display: none; }
+[data-bc-theme] .bc-row {
+    display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+    border-bottom: 1px solid var(--hr);
+}
+`;
+
+// ======================== 共享面板工厂 ========================
+// 外壳创建/主题应用/系统切换监听/销毁；内容区由各模块自行渲染。
+// opts: { overlay: boolean, theme: 'system'|'config', colorMode?: 'auto'|'dark'|'light',
+//         live?: boolean（system 模式下监听系统切换）, id?: string, className?: string }
+// 返回: { el, overlay, destroy }
+var createBcPanel = function(opts) {
+    var Overlay = opts.overlay ? document.createElement('div') : null;
+    var El = document.createElement('div');
+    if (opts.id) El.id = opts.id;
+    if (opts.className) El.className = opts.className;
+    El.setAttribute('data-bc-theme', '');
+
+    var ApplyTheme = function() {
+        var Dark;
+        if (opts.theme === 'system') {
+            Dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        } else {
+            var Mode = (opts.colorMode || 'auto') === 'auto'
+                ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+                : opts.colorMode;
+            Dark = Mode === 'dark';
+        }
+        El.classList.toggle('light-mode', !Dark);
+    };
+    ApplyTheme();
+
+    // system 模式下可监听系统主题实时切换
+    var Listener = null;
+    if (opts.theme === 'system' && opts.live) {
+        var MQ = window.matchMedia('(prefers-color-scheme: dark)');
+        Listener = function(E) { El.classList.toggle('light-mode', !E.matches); };
+        if (MQ.addEventListener) MQ.addEventListener('change', Listener);
+    }
+
+    if (Overlay) {
+        Overlay.className = 'BiliCompactOverlay';
+        Overlay.appendChild(El);
+        document.body.appendChild(Overlay);
+    } else {
+        document.body.appendChild(El);
+    }
+
+    var Destroyed = false;
+    var destroy = function() {
+        if (Destroyed) return;
+        Destroyed = true;
+        if (Overlay && Overlay.parentNode) Overlay.parentNode.removeChild(Overlay);
+        if (!Overlay && El.parentNode) El.parentNode.removeChild(El);
+        if (Listener) {
+            var MQ2 = window.matchMedia('(prefers-color-scheme: dark)');
+            if (MQ2.removeEventListener) MQ2.removeEventListener('change', Listener);
+        }
+    };
+    return { el: El, overlay: Overlay, destroy: destroy };
+};
+
+// node 单元测试加载入口；浏览器端(Tampermonkey)此分支不执行
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = CommentRuleEngine;
+}
 
 (function() {
     'use strict';
+    // node --test 环境下跳过整段脚本（无 document/GM_*），保证 require 安全
+    if (typeof document === 'undefined') return;
+
+    // 注入共享面板主题（两个模块的面板统一引用 data-bc-theme 变量与控件）
+    if (typeof GM_addStyle === 'function') GM_addStyle(PANEL_THEME_CSS);
 
     // ======================== 国际化：共享语言解析 ========================
     // 浏览器语言 → 脚本语言代码；两个模块共用，保证语言判定一致。
@@ -84,8 +292,6 @@
                 BtnRename: '改名',
                 BtnOK: '确定',
                 BtnCancel: '取消',
-                BtnCollapse: '折叠',
-                BtnExpand: '展开',
                 BtnClose: '关闭',
                 SearchPlaceholder: '搜索视频标题',
                 EmptyList: '当前页面没有已加载的视频，滚动页面加载后自动同步',
@@ -105,8 +311,6 @@
                 BtnRename: '改名',
                 BtnOK: '確定',
                 BtnCancel: '取消',
-                BtnCollapse: '摺疊',
-                BtnExpand: '展開',
                 BtnClose: '關閉',
                 SearchPlaceholder: '搜尋影片標題',
                 EmptyList: '目前頁面沒有已載入的影片，捲動頁面載入後自動同步',
@@ -126,8 +330,6 @@
                 BtnRename: 'Rename',
                 BtnOK: 'OK',
                 BtnCancel: 'Cancel',
-                BtnCollapse: 'Collapse',
-                BtnExpand: 'Expand',
                 BtnClose: 'Close',
                 SearchPlaceholder: 'Search video titles',
                 EmptyList: 'No videos loaded on this page yet — scroll to load, auto-syncs',
@@ -147,8 +349,6 @@
                 BtnRename: '改名',
                 BtnOK: '確定',
                 BtnCancel: 'キャンセル',
-                BtnCollapse: '折りたたむ',
-                BtnExpand: '展開',
                 BtnClose: '閉じる',
                 SearchPlaceholder: '動画タイトルを検索',
                 EmptyList: 'このページに読み込まれた動画がありません。スクロールすると自動的に同期します',
@@ -343,47 +543,51 @@
         }
     
         // ======================== 浮动面板 ========================
+        // 主题变量与基础控件由共享 PANEL_THEME_CSS 提供（data-bc-theme 属性由工厂打上）；
+        // 此处仅保留布局与列表专属样式。
         GM_addStyle(`
-            #favrename-panel {
-                position: fixed; right: 24px; top: 80px; width: 340px;
-                background: #ffffff; color: #18191c;
-                border: 1px solid #e3e5e7; border-radius: 8px;
-                box-shadow: 0 4px 12px rgba(0,0,0,0.12);
-                z-index: 99999; font-size: 13px; line-height: 1.6;
+            #favrename-panel, #favrename-settings {
+                position: fixed; top: 50%; left: 50%;
+                transform: translate(-50%, -50%);
+                z-index: 99999;
             }
-            #favrename-panel.favrename-collapsed .favrename-panel-body { display: none; }
+            #favrename-panel { width: 340px; }
+            #favrename-settings { width: 300px; max-height: 80vh; overflow-y: auto; }
+            /* 面板主体复用共享折叠结构（bc-collapse-content），去掉 flex gap 保持列表原有分隔 */
+            #favrename-panel .favrename-panel-body.bc-collapse-content { gap: 0; }
             #favrename-panel .favrename-panel-head {
                 display: flex; align-items: center; gap: 8px; padding: 10px 12px;
-                border-bottom: 1px solid #e3e5e7;
+                border-bottom: 1px solid var(--border);
             }
             #favrename-panel .favrename-panel-title { font-weight: bold; white-space: nowrap; }
-            #favrename-panel input.favrename-search {
-                flex: 1; min-width: 0; padding: 4px 8px;
-                border: 1px solid #ccd0d6; border-radius: 4px; font-size: 12px;
-            }
+            #favrename-panel .favrename-search { flex: 1; min-width: 0; }
             #favrename-panel .favrename-panel-body { max-height: 60vh; overflow-y: auto; }
             #favrename-panel .favrename-entry {
                 display: flex; align-items: center; gap: 8px; padding: 8px 12px;
-                border-bottom: 1px solid #f1f2f3;
+                border-bottom: 1px solid var(--hr);
             }
             #favrename-panel .favrename-title {
                 flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
             }
-            #favrename-panel .favrename-custom { color: #00aeec; }
-            #favrename-panel .favrename-orig { color: #9499a0; margin-left: 6px; }
-            #favrename-panel button.favrename-btn {
-                border: 1px solid #ccd0d6; background: #ffffff; border-radius: 4px;
-                padding: 2px 8px; cursor: pointer; font-size: 12px; white-space: nowrap;
-            }
-            #favrename-panel button.favrename-btn:hover { background: #f1f2f3; }
-            #favrename-panel input.favrename-input {
+            #favrename-panel .favrename-custom { color: var(--accent); }
+            #favrename-panel .favrename-orig { color: var(--text-secondary); margin-left: 6px; }
+            #favrename-panel .favrename-input {
                 flex: 1; min-width: 0; padding: 3px 6px;
-                border: 1px solid #00aeec; border-radius: 4px; font-size: 12px;
+                border-color: var(--accent); /* 行内编辑输入框用强调色边框，与普通输入区分 */
             }
-            #favrename-panel .favrename-empty { padding: 16px 12px; color: #9499a0; text-align: center; }
+            #favrename-panel .favrename-empty { padding: 16px 12px; color: var(--text-secondary); text-align: center; }
+            #favrename-settings .favrename-settings-head {
+                display: flex; align-items: center; justify-content: space-between;
+                padding: 10px 12px; border-bottom: 1px solid var(--border); font-weight: bold;
+            }
+            #favrename-settings .bc-row label { flex: 1; }
+            #favrename-settings .favrename-marker {
+                width: 48px; text-align: center;
+            }
         `);
     
         let PanelEl = null;
+        let PanelHandle = null;  // 共享工厂句柄（销毁走 destroy 统一清理）
     
         function renderList(Filter) {
             if (!PanelEl) return;
@@ -415,7 +619,7 @@
                     Title.textContent = Item.origTitle;
                 }
                 const Btn = document.createElement('button');
-                Btn.className = 'favrename-btn';
+                Btn.className = 'bc-btn';
                 Btn.textContent = FR_T('BtnRename');
                 Btn.addEventListener('click', function() { openEditRow(Entry, Item); });
                 Entry.appendChild(Title);
@@ -433,14 +637,14 @@
         function openEditRow(Entry, Item) {
             Entry.innerHTML = '';
             const Input = document.createElement('input');
-            Input.className = 'favrename-input';
+            Input.className = 'bc-input favrename-input';
             // 已改名预填当前自定义名，未改名预填原标题，便于直接裁剪
             Input.value = getRenames()[Item.bvid] || Item.origTitle;
             const Ok = document.createElement('button');
-            Ok.className = 'favrename-btn';
+            Ok.className = 'bc-btn bc-btn-accent';
             Ok.textContent = FR_T('BtnOK');
             const Cancel = document.createElement('button');
-            Cancel.className = 'favrename-btn';
+            Cancel.className = 'bc-btn';
             Cancel.textContent = FR_T('BtnCancel');
             Ok.addEventListener('click', function() {
                 renameEntry(Item.bvid, Input.value);
@@ -477,73 +681,54 @@
     
         function OpenPanel() {
             if (PanelEl) { PanelEl.remove(); PanelEl = null; }
+            if (PanelHandle) { PanelHandle.destroy(); PanelHandle = null; }
             refreshCardList();
-            PanelEl = document.createElement('div');
-            PanelEl.id = 'favrename-panel';
+            // 外壳交给共享工厂：主题跟随系统（system）并实时监听切换（live）
+            PanelHandle = createBcPanel({ id: 'favrename-panel', theme: 'system', live: true });
+            PanelEl = PanelHandle.el;
+            const Body = document.createElement('div');
+            Body.className = 'favrename-panel-body bc-collapse-content';  // 复用共享折叠结构
             const Head = document.createElement('div');
             Head.className = 'favrename-panel-head';
+            // 标题区复用共享折叠头：点击折叠/展开面板主体，箭头旋转
+            const CollapseHead = document.createElement('div');
+            CollapseHead.className = 'bc-collapse-header';
+            CollapseHead.style.flex = '0 0 auto';
+            const Arrow = document.createElement('span');
+            Arrow.className = 'bc-collapse-arrow open';  // 初始展开：箭头指向下
+            Arrow.textContent = ' > ';
             const Title = document.createElement('span');
             Title.className = 'favrename-panel-title';
             Title.textContent = 'BiliFavRename';
+            CollapseHead.appendChild(Arrow);
+            CollapseHead.appendChild(Title);
+            CollapseHead.addEventListener('click', function() {
+                const Collapsed = Body.classList.toggle('collapsed');
+                Arrow.classList.toggle('open', !Collapsed);
+            });
             const Search = document.createElement('input');
-            Search.className = 'favrename-search';
+            Search.className = 'bc-input favrename-search';
             Search.placeholder = FR_T('SearchPlaceholder');
             Search.addEventListener('input', function() { renderList(Search.value); });
-            const Collapse = document.createElement('button');
-            Collapse.className = 'favrename-btn';
-            Collapse.textContent = FR_T('BtnCollapse');
-            Collapse.addEventListener('click', function() {
-                const Collapsed = PanelEl.classList.toggle('favrename-collapsed');
-                Collapse.textContent = Collapsed ? FR_T('BtnExpand') : FR_T('BtnCollapse');
-            });
             const Close = document.createElement('button');
-            Close.className = 'favrename-btn';
+            Close.className = 'bc-btn';
             Close.textContent = FR_T('BtnClose');
             Close.addEventListener('click', function() {
-                PanelEl.remove();
+                PanelHandle.destroy();
                 PanelEl = null;
+                PanelHandle = null;
             });
-            Head.appendChild(Title);
+            Head.appendChild(CollapseHead);
             Head.appendChild(Search);
-            Head.appendChild(Collapse);
             Head.appendChild(Close);
-            const Body = document.createElement('div');
-            Body.className = 'favrename-panel-body';
             PanelEl.appendChild(Head);
             PanelEl.appendChild(Body);
-            document.body.appendChild(PanelEl);
             renderList('');
         }
     
         // ======================== 设置面板 ========================
-        GM_addStyle(`
-            #favrename-settings {
-                position: fixed; right: 24px; top: 80px; width: 300px;
-                background: #ffffff; color: #18191c;
-                border: 1px solid #e3e5e7; border-radius: 8px;
-                box-shadow: 0 4px 12px rgba(0,0,0,0.12);
-                z-index: 99999; font-size: 13px; line-height: 1.8;
-            }
-            #favrename-settings .favrename-settings-head {
-                display: flex; align-items: center; justify-content: space-between;
-                padding: 10px 12px; border-bottom: 1px solid #e3e5e7; font-weight: bold;
-            }
-            #favrename-settings .favrename-settings-row {
-                display: flex; align-items: center; gap: 8px; padding: 8px 12px;
-                border-bottom: 1px solid #f1f2f3;
-            }
-            #favrename-settings .favrename-settings-row label { flex: 1; }
-            #favrename-settings input.favrename-marker {
-                width: 48px; padding: 3px 6px;
-                border: 1px solid #ccd0d6; border-radius: 4px; font-size: 12px; text-align: center;
-            }
-            #favrename-settings .favrename-danger {
-                color: #f25d8e; border-color: #f25d8e; background: #ffffff;
-            }
-            #favrename-settings .favrename-danger:hover { background: #fff1f5; }
-        `);
-    
         let SettingsEl = null;
+        let SettingsHandle = null;  // 共享工厂句柄
     
         // 弱标记字符修改后，对已应用卡片重跑替换
         function setMarker(Char) {
@@ -582,31 +767,34 @@
     
         function OpenSettings() {
             if (SettingsEl) { SettingsEl.remove(); SettingsEl = null; }
+            if (SettingsHandle) { SettingsHandle.destroy(); SettingsHandle = null; }
             const S = getSettings();
-            SettingsEl = document.createElement('div');
-            SettingsEl.id = 'favrename-settings';
+            // 外壳交给共享工厂：主题跟随系统（system）并实时监听切换（live）
+            SettingsHandle = createBcPanel({ id: 'favrename-settings', theme: 'system', live: true });
+            SettingsEl = SettingsHandle.el;
             const Head = document.createElement('div');
             Head.className = 'favrename-settings-head';
             const HeadTitle = document.createElement('span');
             HeadTitle.textContent = FR_T('SettingsTitle');
             const Close = document.createElement('button');
-            Close.className = 'favrename-btn';
+            Close.className = 'bc-btn';
             Close.textContent = FR_T('BtnClose');
             Close.addEventListener('click', function() {
-                SettingsEl.remove();
+                SettingsHandle.destroy();
                 SettingsEl = null;
+                SettingsHandle = null;
             });
             Head.appendChild(HeadTitle);
             Head.appendChild(Close);
             SettingsEl.appendChild(Head);
-    
+
             // 弱标记字符
             const RowMarker = document.createElement('div');
-            RowMarker.className = 'favrename-settings-row';
+            RowMarker.className = 'bc-row';
             const LabelMarker = document.createElement('label');
             LabelMarker.textContent = FR_T('LabelMarker');
             const MarkerInput = document.createElement('input');
-            MarkerInput.className = 'favrename-marker';
+            MarkerInput.className = 'bc-input favrename-marker';
             MarkerInput.value = S.marker;
             MarkerInput.maxLength = 4;
             MarkerInput.addEventListener('change', function() {
@@ -616,10 +804,10 @@
             RowMarker.appendChild(LabelMarker);
             RowMarker.appendChild(MarkerInput);
             SettingsEl.appendChild(RowMarker);
-    
+
             // 总开关
             const RowToggle = document.createElement('div');
-            RowToggle.className = 'favrename-settings-row';
+            RowToggle.className = 'bc-row';
             const LabelToggle = document.createElement('label');
             LabelToggle.textContent = FR_T('LabelToggle');
             const Toggle = document.createElement('input');
@@ -632,12 +820,12 @@
             RowToggle.appendChild(LabelToggle);
             RowToggle.appendChild(Toggle);
             SettingsEl.appendChild(RowToggle);
-    
+
             // 清空全部映射
             const RowClear = document.createElement('div');
-            RowClear.className = 'favrename-settings-row';
+            RowClear.className = 'bc-row';
             const ClearBtn = document.createElement('button');
-            ClearBtn.className = 'favrename-btn favrename-danger';
+            ClearBtn.className = 'bc-btn bc-btn-danger';
             ClearBtn.textContent = FR_T('BtnClearAll');
             ClearBtn.addEventListener('click', function() {
                 clearAllRenames();
@@ -645,8 +833,6 @@
             });
             RowClear.appendChild(ClearBtn);
             SettingsEl.appendChild(RowClear);
-    
-            document.body.appendChild(SettingsEl);
         }
     
         // ======================== 菜单注册与初始化 ========================
@@ -717,6 +903,11 @@
                 LogInitError: '初始化失败:',
                 LogObserverStarted: 'MutationObserver 已启动，监听容器:',
                 LogUrlChanged: 'URL变化:',
+                LogPurifierStarted: '评论净化器已启动',
+                LogPurifierBlockerCompat: '（检测到 BilibiliBlocker，兼容模式）',
+                LogPurifierStopped: '评论净化器已停止',
+                LogPurifierBlocked: '已屏蔽评论（命中: {0}）',
+                LogPurifierReplaced: '已替换评论{0}: 原 [{1}] 现 [{2}]',
     
                 // Menu
                 MenuSettings: 'Bilibili精简设置',
@@ -739,6 +930,15 @@
                 PanelKeepUpids: '保留UP主ID（逗号分隔）',
                 PanelDebug: '调试模式',
                 PanelEnableCommentPurifier: '启用评论净化（删除@提及，隐藏短评论）',
+                PanelCommentSection: '评论屏蔽',
+                CommentFuzzyLabel: '评论屏蔽词（每行一条）',
+                CommentRegexLabel: '评论屏蔽正则（每行一条）',
+                CommentReplaceLabel: '评论内容替换（关键词=>替换词）',
+                EmoticonReplaceLabel: '表情替换（图片alt=>文本，留空删除）',
+                EnableReplacement: '启用内容替换',
+                ClearEmoticons: '清除评论全部表情',
+                ReplaceSearchTerms: '搜索跳转词转普通文本',
+                PurifierSectionHint: '规则保存后立即对已加载评论生效',
                 PanelLanguage: '界面语言 / Language',
                 PanelLanguageAuto: '自动 (Auto)',
                 PanelBtnPause: '暂停精简',
@@ -789,6 +989,11 @@
                 LogInitError: '初始化失敗:',
                 LogObserverStarted: 'MutationObserver 已啟動，監聽容器:',
                 LogUrlChanged: 'URL變化:',
+                LogPurifierStarted: '評論淨化器已啟動',
+                LogPurifierBlockerCompat: '（偵測到 BilibiliBlocker，相容模式）',
+                LogPurifierStopped: '評論淨化器已停止',
+                LogPurifierBlocked: '已封鎖評論（命中: {0}）',
+                LogPurifierReplaced: '已替換評論{0}: 原 [{1}] 現 [{2}]',
     
                 // Menu
                 MenuSettings: 'Bilibili精簡設定',
@@ -811,6 +1016,15 @@
                 PanelKeepUpids: '保留UP主ID（逗號分隔）',
                 PanelDebug: '除錯模式',
                 PanelEnableCommentPurifier: '啟用評論淨化（刪除@提及，隱藏短評論）',
+                PanelCommentSection: '評論屏蔽',
+                CommentFuzzyLabel: '評論屏蔽詞（每行一條）',
+                CommentRegexLabel: '評論屏蔽正則（每行一條）',
+                CommentReplaceLabel: '評論內容替換（關鍵詞=>替換詞）',
+                EmoticonReplaceLabel: '表情替換（圖片alt=>文字，留空刪除）',
+                EnableReplacement: '啟用內容替換',
+                ClearEmoticons: '清除評論全部表情',
+                ReplaceSearchTerms: '搜尋跳轉詞轉普通文字',
+                PurifierSectionHint: '規則儲存後立即對已載入評論生效',
                 PanelLanguage: '介面語言 / Language',
                 PanelLanguageAuto: '自動 (Auto)',
                 PanelBtnPause: '暫停精簡',
@@ -864,6 +1078,8 @@
                 LogPurifierStarted: 'Comment purifier started',
                 LogPurifierBlockerCompat: ' (BilibiliBlocker detected, compatibility mode)',
                 LogPurifierStopped: 'Comment purifier stopped',
+                LogPurifierBlocked: 'Comment blocked (hit: {0})',
+                LogPurifierReplaced: 'Comment {0} replaced: [{1}] → [{2}]',
     
                 // Menu
                 MenuSettings: 'BiliCompact Settings',
@@ -886,6 +1102,15 @@
                 PanelKeepUpids: 'Whitelist UP IDs (comma-separated)',
                 PanelDebug: 'Debug mode',
                 PanelEnableCommentPurifier: 'Enable comment purifier (remove @mentions, hide short comments)',
+                PanelCommentSection: 'Comment Blocking',
+                CommentFuzzyLabel: 'Block keywords (one per line)',
+                CommentRegexLabel: 'Block regexes (one per line)',
+                CommentReplaceLabel: 'Text replace (keyword=>replacement)',
+                EmoticonReplaceLabel: 'Emoticon replace (alt=>text, empty deletes)',
+                EnableReplacement: 'Enable content replacement',
+                ClearEmoticons: 'Clear all emoticons',
+                ReplaceSearchTerms: 'Search terms → plain text',
+                PurifierSectionHint: 'Rules apply to loaded comments after save',
                 PanelLanguage: 'Language / 語言',
                 PanelLanguageAuto: 'Auto',
                 PanelBtnPause: 'Pause',
@@ -939,6 +1164,8 @@
                 LogPurifierStarted: 'コメント浄化を開始しました',
                 LogPurifierBlockerCompat: '（BilibiliBlocker 検出、互換モード）',
                 LogPurifierStopped: 'コメント浄化を停止しました',
+                LogPurifierBlocked: 'コメントを遮断しました（ヒット: {0}）',
+                LogPurifierReplaced: 'コメントの{0}を置換: 元 [{1}] → 新 [{2}]',
 
                 // Menu
                 MenuSettings: 'BiliCompact設定',
@@ -961,6 +1188,15 @@
                 PanelKeepUpids: '投稿者IDを保持（カンマ区切り）',
                 PanelDebug: 'デバッグモード',
                 PanelEnableCommentPurifier: 'コメント浄化を有効化（@メンションを削除、短文コメントを非表示）',
+                PanelCommentSection: 'コメント遮断',
+                CommentFuzzyLabel: '遮断キーワード（1行1件）',
+                CommentRegexLabel: '遮断正規表現（1行1件）',
+                CommentReplaceLabel: 'コメント文字置換（語=>置換語）',
+                EmoticonReplaceLabel: '絵文字置換（alt=>テキスト、空欄は削除）',
+                EnableReplacement: '内容置換を有効化',
+                ClearEmoticons: 'コメントの絵文字を全削除',
+                ReplaceSearchTerms: '検索リンクを通常テキスト化',
+                PurifierSectionHint: '保存後、読み込み済みコメントへ即時反映',
                 PanelLanguage: '言語 / Language',
                 PanelLanguageAuto: '自動 (Auto)',
                 PanelBtnPause: '一時停止',
@@ -1029,6 +1265,12 @@
             Language: 'auto',             // 界面语言: auto | zh_CN | zh_TW | en_US | ja_JP
             Debug: false,                 // 调试模式
             EnableCommentPurifier: false, // 评论净化器 (删除@提及，隐藏短评论)
+            CommentKeywords: [],       // 评论屏蔽词（模糊，子串包含，大小写不敏感）
+            CommentRegex: [],          // 评论屏蔽正则（去空白后部分匹配）
+            SubstituteWords: [],       // 替换规则 [{find, replace, scopes:['content'|'emoticon']}]
+            EnableReplacement: false,  // 评论内容替换总开关
+            ClearCommentEmoticons: false, // 清除评论中全部表情
+            ReplaceCommentSearchTerms: false, // 搜索跳转关键词转普通文本
             RemovedElements: {},          // 元素去除: { presetId: true/false }
             ColorMode: 'auto',            // 颜色模式: auto | dark | light
         };
@@ -1143,20 +1385,86 @@
             const doneKey = 'bcPurified';
             if (renderer.dataset[doneKey]) return;
             renderer.dataset[doneKey] = '1';
-    
+
             const contents = purifierGetContentsEl(renderer);
             if (!contents) return;
-    
-            // 删除所有 @提及标签
+
+            // 1. 屏蔽判定（用含 @提及的原文，对齐 Blocker 数据层语义）
+            const RawText = contents.textContent || '';
+            const Hit = CommentRuleEngine.blockComment(RawText, Config.CommentKeywords, Config.CommentRegex);
+            if (Hit.state) {
+                renderer.style.display = 'none';
+                renderer.dataset.bcBlocked = '1';
+                try {
+                    const threadRenderer = renderer.getRootNode().host;
+                    if (threadRenderer) threadRenderer.style.display = 'none';
+                } catch (_) {}
+                Log(T('LogPurifierBlocked', Hit.matching));
+                return;
+            }
+            // 未命中：恢复之前被屏蔽的评论（规则变更重扫场景）
+            if (renderer.dataset.bcBlocked) {
+                delete renderer.dataset.bcBlocked;
+                renderer.style.display = '';
+                try {
+                    const threadRenderer = renderer.getRootNode().host;
+                    if (threadRenderer) threadRenderer.style.display = '';
+                } catch (_) {}
+            }
+
+            // 2. 删除所有 @提及标签（原有行为；必须先于搜索词替换，否则会被 a→span 一并吞掉）
             const mentions = contents.querySelectorAll('a[data-type="mention"]');
             for (const m of mentions) {
                 m.remove();
             }
-    
-            // 计算剩余有效字符
+
+            // 3. 内容替换（对齐 Blocker: 表情 → 搜索词 → 关键词；替换元素打 replace 标记防重）
+            if (Config.ClearCommentEmoticons) {
+                contents.querySelectorAll('img').forEach(function(Img) { Img.remove(); });
+            } else if (Config.EnableReplacement) {
+                // 3a. 表情替换：img[alt] 全等匹配，replace 为空 → 删除图片
+                contents.querySelectorAll('img').forEach(function(Img) {
+                    if (Img.hasAttribute('replace')) return;
+                    const Alt = Img.getAttribute('alt');
+                    if (!Alt) return;
+                    const R = CommentRuleEngine.replaceEmoticons(Config.SubstituteWords, Alt);
+                    if (!R.state) return;
+                    if (R.model === 'del') {
+                        Img.remove();
+                        Log(T('LogPurifierReplaced', '表情', Alt, ''));
+                    } else {
+                        const Span = document.createElement('span');
+                        Span.setAttribute('replace', '');
+                        Span.textContent = R.content;
+                        Img.replaceWith(Span);
+                        Log(T('LogPurifierReplaced', '表情', Alt, R.content));
+                    }
+                });
+                // 3b. 搜索跳转词：剩余 a 全部转为普通 span（@提及已删，此处都是搜索词）
+                if (Config.ReplaceCommentSearchTerms) {
+                    contents.querySelectorAll('a').forEach(function(A) {
+                        const Span = document.createElement('span');
+                        Span.setAttribute('replace', '');
+                        Span.textContent = A.textContent;
+                        A.replaceWith(Span);
+                    });
+                }
+                // 3c. 关键词替换：span 文本 contains(find) 且 scope 含 'content'
+                contents.querySelectorAll('span').forEach(function(Span) {
+                    if (Span.getAttribute('replace') !== null) return;
+                    const OldText = Span.textContent || '';
+                    const R = CommentRuleEngine.replaceKeywords(Config.SubstituteWords, OldText, 'content');
+                    if (!R.state) return;
+                    Span.textContent = R.content;
+                    Span.setAttribute('replace', '');
+                    Log(T('LogPurifierReplaced', '内容', OldText, R.content));
+                });
+            }
+
+            // 4. 计算剩余有效字符（原有行为）
             const remaining = contents.textContent.replace(/\s+/g, '').trim();
-    
-            // 不足5字 -> 隐藏整条评论
+
+            // 不足5字 -> 隐藏整条评论（原有行为）
             if (remaining.length < 5) {
                 renderer.style.display = 'none';
                 try {
@@ -1166,6 +1474,19 @@
             }
         }
     
+        /**
+         * 规则变更后重扫全部已渲染评论：
+         * 清除 bcPurified 防重标记后重新处理——屏蔽判定按新规则恢复/隐藏，
+         * 替换阶段因元素带 replace 标记而幂等。
+         */
+        function purifierRescanAll() {
+            if (!PurifierStarted) return;
+            purifierFindRenderers().forEach(function(R) {
+                delete R.dataset.bcPurified;
+            });
+            purifierFindRenderers().forEach(purifierProcessRenderer);
+        }
+
         /**
          * 启动评论净化器
          * - 监听评论区动态加载，自动处理新增评论
@@ -1838,55 +2159,17 @@
                     font-size: 14px;
                 }
                 .BiliCompactPanel {
-                    /* Dark theme (default) variables */
-                    --bg: #1e1e1e;
-                    --text: #eee;
-                    --text-secondary: #ccc;
-                    --text-heading: #fff;
-                    --input-bg: #2a2a2a;
-                    --border: #333;
-                    --border-light: #444;
-                    --hr: #333;
-                    --accent: #fb7299;
-                    --accent-hover: #ff85a8;
-                    --badge-off: #666;
-                    --btn-secondary-bg: #444;
-                    --btn-secondary-hover: #555;
-                    --btn-secondary-text: #fff;
-                    --collapse-hover: #333;
-    
-                    background: var(--bg);
-                    color: var(--text);
+                    /* 变量与容器基础（背景/圆角/阴影/边框）由共享 PANEL_THEME_CSS 提供 */
+                    font-size: 14px; /* 保持原面板字号，覆盖共享默认 13px */
                     padding: 24px 30px;
-                    border-radius: 16px;
-                    box-shadow: 0 8px 40px rgba(0,0,0,0.6);
                     min-width: 340px;
                     max-width: 420px;
-                    border: 1px solid var(--border);
                     display: flex;
                     flex-direction: column;
                     gap: 12px;
                     position: relative;
                     max-height: 85vh;
                     overflow-y: auto;
-                }
-                .BiliCompactPanel.light-mode {
-                    --bg: #ffffff;
-                    --text: #333;
-                    --text-secondary: #555;
-                    --text-heading: #111;
-                    --input-bg: #f5f5f5;
-                    --border: #ddd;
-                    --border-light: #e0e0e0;
-                    --hr: #eee;
-                    --accent: #00AEEC;
-                    --accent-hover: #33c0f0;
-                    --badge-off: #bbb;
-                    --btn-secondary-bg: #eee;
-                    --btn-secondary-hover: #ddd;
-                    --btn-secondary-text: #333;
-                    --collapse-hover: #eee;
-                    box-shadow: 0 4px 24px rgba(0,0,0,0.12);
                 }
                 .BiliCompactPanel h3 {
                     margin: 0 0 4px 0;
@@ -1927,10 +2210,8 @@
                     cursor: pointer;
                 }
                 .BiliCompactPanel input[type="checkbox"] {
-                    accent-color: var(--accent);
                     width: 18px;
                     height: 18px;
-                    cursor: pointer;
                 }
                 .BiliCompactPanel .BtnRow {
                     display: flex;
@@ -1939,32 +2220,9 @@
                     margin-top: 6px;
                     flex-wrap: wrap;
                 }
-                .BiliCompactPanel button {
-                    background: var(--accent);
-                    border: none;
-                    color: #fff;
-                    padding: 6px 18px;
-                    border-radius: 20px;
-                    cursor: pointer;
+                .BiliCompactPanel button.bc-btn {
                     font-size: 14px;
-                    font-family: inherit;
-                    transition: background 0.2s;
-                }
-                .BiliCompactPanel button.Secondary {
-                    background: var(--btn-secondary-bg);
-                    color: var(--btn-secondary-text);
-                }
-                .BiliCompactPanel button:hover {
-                    background: var(--accent-hover);
-                }
-                .BiliCompactPanel button.Secondary:hover {
-                    background: var(--btn-secondary-hover);
-                }
-                .BiliCompactPanel .Hint {
-                    font-size: 12px;
-                    color: #888;
-                    margin-top: -4px;
-                    line-height: 1.4;
+                    padding: 6px 18px;
                 }
                 .BiliCompactPanel .StatusRow {
                     display: flex;
@@ -1984,66 +2242,46 @@
                 .BiliCompactPanel .StatusBadge.Off {
                     background: var(--badge-off);
                 }
-                /* Collapsible section */
-                .BiliCompactPanel .CollapseHeader {
-                    display: flex;
-                    align-items: center;
-                    gap: 6px;
-                    cursor: pointer;
-                    padding: 6px 8px;
-                    border-radius: 6px;
-                    user-select: none;
-                    font-size: 13px;
-                    color: var(--accent);
-                    font-weight: 500;
-                    transition: background 0.15s;
-                }
-                .BiliCompactPanel .CollapseHeader:hover {
-                    background: var(--collapse-hover);
-                }
-                .BiliCompactPanel .CollapseArrow {
-                    transition: transform 0.2s;
-                    font-size: 12px;
-                    line-height: 1;
-                }
-                .BiliCompactPanel .CollapseArrow.open {
-                    transform: rotate(90deg);
-                }
-                .BiliCompactPanel .CollapseContent {
-                    display: flex;
-                    flex-direction: column;
-                    gap: 8px;
-                }
-                .BiliCompactPanel .CollapseContent.collapsed {
-                    display: none;
-                }
             `;
             document.head.appendChild(StyleEl);
         }
     
         let PanelDestroyFn = null;
-    
+
+        // 替换规则 ↔ 文本（每行 find=>replace）；按 scope 分流
+        function purifierRulesToText(Rules, Scope) {
+            return (Rules || []).filter(function(R) {
+                return R && R.scopes && R.scopes.indexOf(Scope) !== -1;
+            }).map(function(R) {
+                return R.find + '=>' + (R.replace || '');
+            }).join('\n');
+        }
+        function purifierTextToRules(Text, Scope) {
+            const Out = [];
+            String(Text || '').split('\n').forEach(function(Line) {
+                const M = Line.match(/^(.+?)=>(.*)$/);
+                if (!M) return; // 无 => 分隔的非法行跳过
+                const Find = M[1].trim();
+                if (!Find) return;
+                Out.push({ find: Find, replace: M[2], scopes: [Scope] });
+            });
+            return Out;
+        }
+
         function OpenConfigPanel() {
+            const OldConfig = Object.assign({}, Config); // 面板打开时的快照（评论规则变更检测用）
+
             if (PanelDestroyFn) {
                 PanelDestroyFn();
                 PanelDestroyFn = null;
             }
     
             InjectPanelStyles();
-    
-            const Overlay = document.createElement('div');
-            Overlay.className = 'BiliCompactOverlay';
-    
-            const Panel = document.createElement('div');
-            Panel.className = 'BiliCompactPanel';
-    
-            // 应用颜色模式
-            const effectiveColorMode = (Config.ColorMode || 'auto') === 'auto'
-                ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
-                : Config.ColorMode;
-            if (effectiveColorMode === 'light') {
-                Panel.classList.add('light-mode');
-            }
+
+            // 外壳交给共享工厂：主题按 Config.ColorMode（auto 跟随系统，打开时计算一次）
+            const PanelHandle = createBcPanel({ overlay: true, theme: 'config', colorMode: Config.ColorMode });
+            const Overlay = PanelHandle.overlay;
+            const Panel = PanelHandle.el;
     
             // 语言选项
             const LangOptions = [
@@ -2079,25 +2317,43 @@
                 </select></label>
                 <label>${T('PanelKeepUpids')} <input type="text" id="CfgKeepUids" value="${(Config.KeepSpecialUPIDs || []).join(',')}"></label>
                 <hr style="margin:8px 0;border:none;border-top:1px solid var(--hr, #333)">
-                <div class="CollapseHeader" id="CfgCollapseRm">
-                    <span class="CollapseArrow" id="CfgCollapseRmArrow">▸</span>
+                <div class="bc-collapse-header" id="CfgCollapsePurifier">
+                    <span class="bc-collapse-arrow" id="CfgCollapsePurifierArrow"> > </span>
+                    <span>${T('PanelCommentSection')}</span>
+                </div>
+                <div class="bc-collapse-content collapsed" id="CfgCollapsePurifierContent">
+                    <label>${T('CommentFuzzyLabel')}</label>
+                    <textarea id="CfgCommentKeywords" rows="3" style="width:100%;background:var(--input-bg);color:var(--text);border:1px solid var(--border-light);border-radius:6px;font-size:13px;font-family:inherit;resize:vertical">${(Config.CommentKeywords || []).join('\n')}</textarea>
+                    <label>${T('CommentRegexLabel')}</label>
+                    <textarea id="CfgCommentRegex" rows="3" style="width:100%;background:var(--input-bg);color:var(--text);border:1px solid var(--border-light);border-radius:6px;font-size:13px;font-family:inherit;resize:vertical">${(Config.CommentRegex || []).join('\n')}</textarea>
+                    <label>${T('CommentReplaceLabel')}</label>
+                    <textarea id="CfgCommentReplace" rows="2" style="width:100%;background:var(--input-bg);color:var(--text);border:1px solid var(--border-light);border-radius:6px;font-size:13px;font-family:inherit;resize:vertical">${purifierRulesToText(Config.SubstituteWords, 'content')}</textarea>
+                    <label>${T('EmoticonReplaceLabel')}</label>
+                    <textarea id="CfgEmoticonReplace" rows="2" style="width:100%;background:var(--input-bg);color:var(--text);border:1px solid var(--border-light);border-radius:6px;font-size:13px;font-family:inherit;resize:vertical">${purifierRulesToText(Config.SubstituteWords, 'emoticon')}</textarea>
+                    <label>${T('EnableReplacement')} <input type="checkbox" id="CfgEnableReplacement" ${Config.EnableReplacement ? 'checked' : ''}></label>
+                    <label>${T('ClearEmoticons')} <input type="checkbox" id="CfgClearEmoticons" ${Config.ClearCommentEmoticons ? 'checked' : ''}></label>
+                    <label>${T('ReplaceSearchTerms')} <input type="checkbox" id="CfgReplaceSearchTerms" ${Config.ReplaceCommentSearchTerms ? 'checked' : ''}></label>
+                    <div class="bc-hint">${T('PurifierSectionHint')}</div>
+                </div>
+                <hr style="margin:8px 0;border:none;border-top:1px solid var(--hr, #333)">
+                <div class="bc-collapse-header" id="CfgCollapseRm">
+                    <span class="bc-collapse-arrow" id="CfgCollapseRmArrow"> > </span>
                     <span>${T('PanelRemovalSection')}</span>
                 </div>
-                <div class="CollapseContent collapsed" id="CfgCollapseRmContent">
+                <div class="bc-collapse-content collapsed" id="CfgCollapseRmContent">
                 ${ELEMENT_REMOVAL_PRESETS.map(function(P) {
                     return '<label><span style="flex:1">' + T(RmNameKey(P.id)) + '</span> <input type="checkbox" id="CfgRm_' + P.id + '" ' + ((Config.RemovedElements || {})[P.id] ? 'checked' : '') + '></label>';
                 }).join('')}
                 </div>
                 <div class="BtnRow">
-                    <button class="Secondary" id="CfgToggle">${IsActive ? T('PanelBtnPause') : T('PanelBtnResume')}</button>
-                    <button class="Secondary" id="CfgReset">${T('PanelBtnReset')}</button>
-                    <button id="CfgSave">${T('PanelBtnSave')}</button>
+                    <button class="bc-btn" id="CfgToggle">${IsActive ? T('PanelBtnPause') : T('PanelBtnResume')}</button>
+                    <button class="bc-btn" id="CfgReset">${T('PanelBtnReset')}</button>
+                    <button class="bc-btn bc-btn-accent" id="CfgSave">${T('PanelBtnSave')}</button>
                 </div>
             `;
-    
-            Overlay.appendChild(Panel);
-            document.body.appendChild(Overlay);
-    
+
+            // 面板与遮罩已由工厂挂载（Overlay 内含 Panel，已 append 到 body）
+
             // —— 事件绑定 ——
     
             document.getElementById('CfgSave').addEventListener('click', function() {
@@ -2124,11 +2380,26 @@
                             if (cb) obj[ELEMENT_REMOVAL_PRESETS[I].id] = cb.checked;
                         }
                         return obj;
-                    })()
+                    })(),
+                    EnableReplacement: document.getElementById('CfgEnableReplacement').checked,
+                    ClearCommentEmoticons: document.getElementById('CfgClearEmoticons').checked,
+                    ReplaceCommentSearchTerms: document.getElementById('CfgReplaceSearchTerms').checked,
+                    CommentKeywords: document.getElementById('CfgCommentKeywords').value.split('\n').map(S => S.trim()).filter(Boolean),
+                    CommentRegex: document.getElementById('CfgCommentRegex').value.split('\n').map(S => S.trim()).filter(Boolean),
+                    SubstituteWords: purifierTextToRules(document.getElementById('CfgCommentReplace').value, 'content')
+                        .concat(purifierTextToRules(document.getElementById('CfgEmoticonReplace').value, 'emoticon'))
                 };
                 Object.assign(Config, NewConfig);
                 SaveConfig(Config);
-    
+
+                // 评论规则变更 → 重扫全部评论（恢复不再命中的、隐藏新命中的、应用新替换）
+                const CommentKeys = ['CommentKeywords', 'CommentRegex', 'SubstituteWords',
+                    'EnableReplacement', 'ClearCommentEmoticons', 'ReplaceCommentSearchTerms'];
+                const RulesChanged = CommentKeys.some(function(K) {
+                    return JSON.stringify(OldConfig[K]) !== JSON.stringify(Config[K]);
+                });
+                if (RulesChanged) purifierRescanAll();
+
                 // 语言变更时立即生效
                 if (LangChanged) {
                     CurrentLang = ResolveLanguage();
@@ -2164,6 +2435,13 @@
                 document.getElementById('CfgKeepPromoted').checked = Config.KeepPromoted;
                 document.getElementById('CfgDebug').checked = Config.Debug;
                 document.getElementById("CfgEnablePurifier").checked = false;
+                document.getElementById('CfgEnableReplacement').checked = false;
+                document.getElementById('CfgClearEmoticons').checked = false;
+                document.getElementById('CfgReplaceSearchTerms').checked = false;
+                document.getElementById('CfgCommentKeywords').value = '';
+                document.getElementById('CfgCommentRegex').value = '';
+                document.getElementById('CfgCommentReplace').value = '';
+                document.getElementById('CfgEmoticonReplace').value = '';
                 document.getElementById('CfgColorMode').value = Config.ColorMode || 'auto';
                 document.getElementById('CfgKeepUids').value = '';
                 for (var I = 0; I < ELEMENT_REMOVAL_PRESETS.length; I++) {
@@ -2198,6 +2476,20 @@
                 this.textContent = IsActive ? T('PanelBtnPause') : T('PanelBtnResume');
             });
     
+            // 评论屏蔽折叠切换
+            document.getElementById('CfgCollapsePurifier').addEventListener('click', function() {
+                const content = document.getElementById('CfgCollapsePurifierContent');
+                const arrow = document.getElementById('CfgCollapsePurifierArrow');
+                const isCollapsed = content.classList.contains('collapsed');
+                if (isCollapsed) {
+                    content.classList.remove('collapsed');
+                    arrow.classList.add('open');
+                } else {
+                    content.classList.add('collapsed');
+                    arrow.classList.remove('open');
+                }
+            });
+
             // 去除元素折叠切换
             document.getElementById('CfgCollapseRm').addEventListener('click', function() {
                 const content = document.getElementById('CfgCollapseRmContent');
@@ -2227,9 +2519,7 @@
     
             function DestroyPanel() {
                 document.removeEventListener('keydown', OnKeyDown);
-                if (Overlay.parentNode) {
-                    Overlay.parentNode.removeChild(Overlay);
-                }
+                PanelHandle.destroy();
                 PanelDestroyFn = null;
             }
     
