@@ -18,11 +18,15 @@ BiliCompact – A Tampermonkey script that severely trims the Bilibili web feed.
 - **白名单机制**：保留指定 UP 主（通过 UID）的视频，不受数量限制。
 - **一键切换**：悬浮按钮可随时开启 / 关闭精简模式，恢复原始视图。
 - **实时计数器**：展示当前显示 / 总视频数，以及隐藏数量。
-- **快捷键支持**：`Ctrl+Shift+数字` 快速调整数量（例如 `Ctrl+Shift+5` 立即显示 5 个视频，`Ctrl+Shift+0` 关闭精简）。
 - **配置持久化**：所有设置自动保存在浏览器中，跨页面生效。
 - **悬浮配置面板**：可视化调整所有选项，无需手动编辑脚本。
 - **广泛兼容**：适用于 B 站首页、分区（动画、音乐、游戏、科技等）、动态、搜索、番剧、国创等绝大多数页面。
 - **轻量高效**：使用 MutationObserver 监听动态加载，节流防抖，性能优化。
+- **评论屏蔽**：配置面板可设模糊词/正则屏蔽规则，命中即隐藏整条评论；支持表情替换、搜索跳转词转普通文本、关键词替换，规则变更即时生效。
+- **收藏夹重命名**：在收藏夹页（space.bilibili.com/*/favlist）为视频设置本地自定义名，按 BV 号全局生效；纯显示层替换，零网络请求，无风控面。
+- **重命名面板**：浮动面板列出已渲染视频，随滚动同步，支持搜索、折叠、逐条改名/恢复原名。
+- **重命名设置**：弱标记字符（默认 `*` 前缀）、总开关、清空全部映射。
+- **多语言界面**：自动适配简体中文、繁体中文、英语、日语；信息流精简的配置面板内可手动切换。
 
 ###  安装方法
 
@@ -31,13 +35,42 @@ BiliCompact – A Tampermonkey script that severely trims the Bilibili web feed.
    - 点击main.user.js，在右侧点击raw即可。
 3. 刷新 B 站页面，即可在左下角看到控制按钮。
 
+> 一个脚本覆盖信息流精简与收藏夹重命名两类功能，无需分别安装。
+
 > 建议配合 **Adblock** 等插件使用，效果更佳。
 
 ###  使用指南
 
-- **切换精简状态**：点击页面右下角的 `🔴 精简已开启` 按钮，一键开启 / 关闭精简。
-- **调整数量**：使用快捷键 `Ctrl+Shift+1~9` 快速设置最大数量（例如 `Ctrl+Shift+5` 表示最多显示 5 个视频）。
-- **打开配置面板**：点击 Tampermonkey 菜单中的 `⚙️ B站精简设置`，或通过脚本菜单项进入可视化配置。
+- **切换精简状态**：点击页面右下角的 `精简已开启` 按钮，一键开启 / 关闭精简。
+- **调整数量**：通过配置面板输入最大显示数量。
+- **打开配置面板**：点击 Tampermonkey 菜单中的 `B站精简设置`，或通过脚本菜单项进入可视化配置。
+- **收藏夹重命名**：打开 B 站任意收藏夹页，GM 菜单出现「打开重命名面板」与「设置」；面板内可直接改名，按 BV 号全局生效。
+
+###  评论屏蔽使用教程
+
+在配置面板展开「评论屏蔽」区块（需先开启「启用评论净化」）：
+
+- **评论屏蔽词**（每行一条）：评论内容含任一词即隐藏整条评论，大小写不敏感。示例：
+
+  ```
+  广告
+  低价出售
+  ```
+
+- **评论屏蔽正则**（每行一条）：按正则部分匹配隐藏，匹配前自动去除评论中的空白。示例：
+
+  ```
+  \d{8,}            屏蔽超长数字（如 UID 串）
+  (加|v)\s*[xX]     微信号广告
+  ```
+
+  单条正则写错会被自动跳过并在控制台提示，不影响其余规则。
+
+- **评论内容替换**（每行一条 `关键词=>替换词`）：评论中的关键词全文替换为替换词。
+- **表情替换**（每行一条 `图片alt=>文本`）：指定表情替换为文本，替换文本留空表示删除该表情。
+- **开关**：启用内容替换 / 清除评论全部表情 / 搜索跳转词转普通文本（评论内蓝色搜索链接变为普通文本）。
+
+保存后规则立即对已加载评论生效，无需刷新页面。
 
 ###  配置选项（面板可调）
 
@@ -52,18 +85,9 @@ BiliCompact – A Tampermonkey script that severely trims the Bilibili web feed.
 | 保留 UP 主 ID | 输入数字 UID（逗号分隔），这些 UP 主的视频将始终显示 |
 | 显示计数器 | 在左上角显示视频统计信息 |
 | 显示切换按钮 | 在右下角显示开启 / 关闭按钮 |
-| 启用快捷键 | 允许使用 Ctrl+Shift+数字 调整数量 |
 
 所有更改**自动保存**，无需重启脚本。
 
-###  快捷键一览
-
-| 快捷键 | 作用 |
-|--------|------|
-| `Ctrl+Shift+1` ~ `Ctrl+Shift+9` | 设置最大显示数量为 1~9 |
-| `Ctrl+Shift+0` | 关闭精简模式（恢复全部视频） |
-
-> 若快捷键无响应，请检查是否与其他浏览器扩展冲突，并确保脚本配置中“启用快捷键”已勾选。
 
 ###  注意事项
 
@@ -77,6 +101,7 @@ BiliCompact – A Tampermonkey script that severely trims the Bilibili web feed.
 - **技术栈**：原生 JavaScript + GM_* API
 - **代码风格**：ES5 兼容（保证广泛兼容性）
 - **调试模式**：在配置面板中开启 `debug` 选项（需要手动在脚本中修改 `config.debug = true` 或通过 GM 存储设置），可在控制台查看详细日志。
+- **模块结构**：单脚本双模块，按域名路由（space.bilibili.com → 收藏夹重命名，其余 B 站页面 → 信息流精简），模块间存储键隔离（favrename_* 前缀）。
 
 ###  贡献与反馈
 
@@ -88,7 +113,7 @@ BiliCompact – A Tampermonkey script that severely trims the Bilibili web feed.
 ###  开源协议
 
 本项目采用 [MIT License](LICENSE) 授权，你可以自由使用、修改、分发。
-
+PS：本人很喜欢英文大驼峰式命名风格。
 ---
 
 ## English
@@ -109,11 +134,12 @@ Tired of endless video streams? BiliCompact lets you set a maximum number of vis
 - **Whitelist**: Keep videos from specific UP IDs – they are always shown regardless of the limit.
 - **One‑click toggle**: Floating button to enable/disable the limiter instantly.
 - **Live counter**: Shows current displayed / total videos and hidden count.
-- **Keyboard shortcuts**: `Ctrl+Shift+Number` to change the limit quickly (e.g., `Ctrl+Shift+5` sets to 5; `Ctrl+Shift+0` disables limiting).
 - **Persistent settings**: All preferences are saved in browser storage and persist across pages.
 - **Visual config panel**: Tweak every option through a GUI – no need to edit the script manually.
 - **Broad compatibility**: Works on homepage, channels (animation, music, game, tech, etc.), dynamic, search, anime, and most other Bilibili pages.
 - **Lightweight & efficient**: Uses MutationObserver with throttling and debouncing for performance.
+- **Comment blocking**: Configure fuzzy/regex block rules in the panel — matching comments are hidden entirely; emoticon replacement, search-term plain-text conversion, and keyword replacement are supported, applied immediately on save.
+- **Multilingual UI**: Auto-adapts to Simplified Chinese, Traditional Chinese, English, and Japanese; manually switchable inside the config panel.
 
 ###  Installation
 
@@ -126,9 +152,34 @@ Tired of endless video streams? BiliCompact lets you set a maximum number of vis
 
 ###  Usage
 
-- **Toggle limiting**: Click the `🔴 精简已开启` (or `Enabled`) button at the bottom‑right.
-- **Quick‑set number**: Use `Ctrl+Shift+1~9` to set the max video count instantly.
-- **Open config panel**: Click `⚙️ B站精简设置` in the Tampermonkey menu, or use the script’s menu entry.
+- **Toggle limiting**: Click the `精简已开启` (or `Enabled`) button at the bottom‑right.
+- **Open config panel**: Click `B站精简设置` in the Tampermonkey menu, or use the script’s menu entry.
+
+###  Comment Blocking Tutorial
+
+Open the "Comment Blocking" section in the config panel (enable "Comment Purifier" first):
+
+- **Block keywords** (one per line): a comment is hidden entirely when it contains any keyword; case-insensitive. Example:
+
+  ```
+  广告
+  低价出售
+  ```
+
+- **Block regexes** (one per line): partial regex match; whitespace is stripped from the comment before matching. Example:
+
+  ```
+  \d{8,}            hides comments with long digit runs (e.g. UID spam)
+  (加|v)\s*[xX]     hides WeChat ad comments
+  ```
+
+  A broken regex is skipped with a console warning and never breaks the other rules.
+
+- **Text replace** (one `keyword=>replacement` per line): replaces every occurrence of the keyword in comment text.
+- **Emoticon replace** (one `alt=>text` per line): replaces a matching emoticon image with text; leave the replacement empty to delete the image.
+- **Switches**: enable content replacement / clear all emoticons / convert search-term links to plain text.
+
+Rules apply to already-loaded comments right after saving - no page refresh needed.
 
 ###  Configuration (via GUI)
 
@@ -143,18 +194,8 @@ Tired of endless video streams? BiliCompact lets you set a maximum number of vis
 | Whitelist UP IDs | Comma‑separated UIDs whose videos always show |
 | Show counter | Display stats in the top‑left corner |
 | Show toggle button | Display the enable/disable button in the bottom‑right |
-| Enable shortcuts | Allow using `Ctrl+Shift+Number` to adjust the limit |
 
 All changes are **saved automatically** – no restart needed.
-
-###  Shortcuts
-
-| Shortcut | Action |
-|----------|--------|
-| `Ctrl+Shift+1` ~ `Ctrl+Shift+9` | Set max videos to 1–9 |
-| `Ctrl+Shift+0` | Disable the limiter (show all videos) |
-
-> If shortcuts don't work, check for conflicts with other extensions and make sure "Enable shortcuts" is ticked in the config panel.
 
 ###  Notes
 
@@ -183,3 +224,7 @@ This project is licensed under the [MIT License](LICENSE) – feel free to use, 
 ---
 
 **Enjoy a cleaner Bilibili feed!** 
+
+### 对开发者本人
+
+本项目不采用emoji。
