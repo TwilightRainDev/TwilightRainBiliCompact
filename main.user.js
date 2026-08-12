@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         Simplified Bilibili Web Homepage~ BiliCompact
 // @name:zh-CN   网页端Bilibili主页精简~ BiliCompact
+// @name:zh-TW   網頁端Bilibili主頁精簡~ BiliCompact
 // @name:ja      Web版Bilibiliのhomepageの簡素化
 // @namespace    http://tampermonkey.net/
-// @version      2.7.0
+// @version      2.8.0
 // @license MIT
-// @name:   Are you tired of the overwhelming number of videos on Bilibili's web interface? Want a more streamlined interface? This plugin helps you display only a specified number of videos, with support for multiple pages, black/whitelists, and persistent configuration. Its non‑intrusive design injects no UI elements into Bilibili pages. Supports Simplified Chinese, Traditional Chinese, and English. Also includes local renaming of videos in the favorites page (merged from BiliFavRename), with pure display‑layer replacement and zero network requests.
-// @name:zh-CN   你是否厌倦了网页端极多视频？想要更简要的界面？这个插件将帮助你只显示指定数量的视频，支持多种页面、黑/白名单、配置持久化。非侵入式设计，不在页面注入任何UI元素。支持简中，繁中，英语。另含收藏夹页视频本地重命名，纯显示层替换，零网络请求。
-// @description:ja     ビリビリ の ウェブ 版では、動画が多すぎてうんざりしていませんか？もっと シンプル で見やすい インターフェース が欲しいと思いませんか？この プラグイン は、表示する動画数を指定した件数に制限するお手伝いをします。複数 ページ への対応や、 ホワイトリスト ／ ブラックリスト の設定、そして設定内容の保存も可能です。また、 ビリビリ の ページ に一切の ユーザー インターフェース 要素を追加しない、非侵襲的な設計を採用しています。対応言語は、簡体中文、繁体中文、英語です。さらに、お気に入り ページ の動画を ローカル で リネーム する機能も搭載しています。表示 レイヤー のみを置き換える純粋な処理のため、 ネットワークリクエスト は一切発生しません。
+// @description  Are you tired of the overwhelming number of videos on Bilibili's web interface? Want a more streamlined interface? This plugin helps you display only a specified number of videos, with support for multiple pages, black/whitelists, and persistent configuration. Its non‑intrusive design injects no UI elements into Bilibili pages. Supports Simplified Chinese, Traditional Chinese, English, and Japanese. Also includes local renaming of videos in the favorites page, with pure display‑layer replacement and zero network requests.
+// @description:zh-CN   你是否厌倦了网页端极多视频？想要更简要的界面？这个插件将帮助你只显示指定数量的视频，支持多种页面、黑/白名单、配置持久化。非侵入式设计，不在页面注入任何UI元素。支持简中，繁中，英语，日语。另含收藏夹页视频本地重命名，纯显示层替换，零网络请求。
+// @description:zh-TW   你是否厭倦了網頁端極多影片？想要更簡要的介面？這個外掛將幫助你只顯示指定數量的影片，支援多種頁面、黑/白名單、設定持久化。非侵入式設計，不在頁面注入任何 UI 元素。支援簡中、繁中、英語、日語。另含收藏夾頁影片本地重新命名，純顯示層替換，零網路請求。
+// @description:ja     ビリビリのウェブ版では、動画が多すぎてうんざりしていませんか？もっとシンプルで見やすいインターフェースが欲しいと思いませんか？このプラグインは、表示する動画数を指定した件数に制限するお手伝いをします。複数 ページ への対応や、ホワイトリスト／ブラックリストの設定、そして設定内容の保存も可能です。また、ビリビリのページに一切の ユーザー インターフェース要素を追加しない、非侵襲的な設計を採用しています。対応言語は、簡体中文、繁体中文、英語、日本語です。さらに、お気に入りページの動画をローカルでリネームする機能も搭載しています。表示レイヤーのみを置き換える純粋な処理のため、ネットワークリクエストは一切発生しません。
 // @author       TwilightRainDev
 // @match        https://www.bilibili.com/
 // @match        https://www.bilibili.com/?*
@@ -47,6 +49,18 @@
 (function() {
     'use strict';
 
+    // ======================== 国际化：共享语言解析 ========================
+    // 浏览器语言 → 脚本语言代码；两个模块共用，保证语言判定一致。
+    // 支持: zh_CN | zh_TW | en_US | ja_JP，未知语言回退 zh_CN
+    function ResolveUILang() {
+        const Nav = (navigator.language || '').toLowerCase();
+        if (/^zh-(tw|hk|mo|hant)([_-]|$)/i.test(Nav)) return 'zh_TW';
+        if (/^zh/i.test(Nav)) return 'zh_CN';
+        if (/^ja/i.test(Nav)) return 'ja_JP';
+        if (/^en/i.test(Nav)) return 'en_US';
+        return 'zh_CN'; // fallback
+    }
+
     // ======================== 模块路由 ========================
     // 空间站（含收藏夹页）→ 收藏夹重命名模块；其余 B 站页面 → 信息流精简模块
     if (location.hostname === 'space.bilibili.com') {
@@ -58,7 +72,109 @@
     // ======================== 模块一：收藏夹重命名（原 BiliFavRename） ========================
     function InitFavRenameModule() {
         'use strict';
-    
+
+        // ======================== 国际化 (i18n) ========================
+        // 四语言字典；语言代码与信息流精简模块一致（共享 ResolveUILang）
+        const FR_I18N = {
+            zh_CN: {
+                LogObserverStarted: 'Observer 已启动，挂载点:',
+                LogInitFav: 'BiliFavRename 已初始化（收藏夹页）',
+                LogInitSpace: 'BiliFavRename 已初始化（空间页，进入收藏夹后启动）',
+                LogCleared: '已清空全部重命名映射',
+                BtnRename: '改名',
+                BtnOK: '确定',
+                BtnCancel: '取消',
+                BtnCollapse: '折叠',
+                BtnExpand: '展开',
+                BtnClose: '关闭',
+                SearchPlaceholder: '搜索视频标题',
+                EmptyList: '当前页面没有已加载的视频，滚动页面加载后自动同步',
+                SettingsTitle: 'BiliFavRename 设置',
+                LabelMarker: '弱标记字符（留空为不标记）',
+                LabelToggle: '启用重命名',
+                BtnClearAll: '清空全部映射',
+                ConfirmClearAll: '确定清空全部重命名映射？此操作不可撤销。',
+                MenuOpenPanel: '打开重命名面板',
+                MenuSettings: '设置',
+            },
+            zh_TW: {
+                LogObserverStarted: 'Observer 已啟動，掛載點:',
+                LogInitFav: 'BiliFavRename 已初始化（收藏夾頁）',
+                LogInitSpace: 'BiliFavRename 已初始化（空間頁，進入收藏夾後啟動）',
+                LogCleared: '已清空全部重新命名對應',
+                BtnRename: '改名',
+                BtnOK: '確定',
+                BtnCancel: '取消',
+                BtnCollapse: '摺疊',
+                BtnExpand: '展開',
+                BtnClose: '關閉',
+                SearchPlaceholder: '搜尋影片標題',
+                EmptyList: '目前頁面沒有已載入的影片，捲動頁面載入後自動同步',
+                SettingsTitle: 'BiliFavRename 設定',
+                LabelMarker: '弱標記字元（留空為不標記）',
+                LabelToggle: '啟用重新命名',
+                BtnClearAll: '清空全部對應',
+                ConfirmClearAll: '確定清空全部重新命名對應？此操作不可復原。',
+                MenuOpenPanel: '開啟重新命名面板',
+                MenuSettings: '設定',
+            },
+            en_US: {
+                LogObserverStarted: 'Observer started, mounting point:',
+                LogInitFav: 'BiliFavRename initialized (favorites page)',
+                LogInitSpace: 'BiliFavRename initialized (space page, starts inside favorites)',
+                LogCleared: 'All rename mappings cleared',
+                BtnRename: 'Rename',
+                BtnOK: 'OK',
+                BtnCancel: 'Cancel',
+                BtnCollapse: 'Collapse',
+                BtnExpand: 'Expand',
+                BtnClose: 'Close',
+                SearchPlaceholder: 'Search video titles',
+                EmptyList: 'No videos loaded on this page yet — scroll to load, auto-syncs',
+                SettingsTitle: 'BiliFavRename Settings',
+                LabelMarker: 'Weak marker char (leave empty for none)',
+                LabelToggle: 'Enable renaming',
+                BtnClearAll: 'Clear All Mappings',
+                ConfirmClearAll: 'Clear all rename mappings? This cannot be undone.',
+                MenuOpenPanel: 'Open Rename Panel',
+                MenuSettings: 'Settings',
+            },
+            ja_JP: {
+                LogObserverStarted: 'Observer 起動、マウントポイント:',
+                LogInitFav: 'BiliFavRename を初期化しました（お気に入りページ）',
+                LogInitSpace: 'BiliFavRename を初期化しました（スペースページ、お気に入りに入ると開始）',
+                LogCleared: 'すべてのリネーム対応を削除しました',
+                BtnRename: '改名',
+                BtnOK: '確定',
+                BtnCancel: 'キャンセル',
+                BtnCollapse: '折りたたむ',
+                BtnExpand: '展開',
+                BtnClose: '閉じる',
+                SearchPlaceholder: '動画タイトルを検索',
+                EmptyList: 'このページに読み込まれた動画がありません。スクロールすると自動的に同期します',
+                SettingsTitle: 'BiliFavRename 設定',
+                LabelMarker: '弱マーカー文字（空欄でマークなし）',
+                LabelToggle: 'リネームを有効化',
+                BtnClearAll: 'すべての対応を削除',
+                ConfirmClearAll: 'すべてのリネーム対応を削除しますか？この操作は取り消せません。',
+                MenuOpenPanel: 'リネームパネルを開く',
+                MenuSettings: '設定',
+            }
+        };
+
+        let FR_Lang = 'zh_CN';
+
+        function FR_T(Key, ...Args) {
+            const Map = FR_I18N[FR_Lang] || FR_I18N['zh_CN'];
+            let Str = Map[Key];
+            if (Str === undefined) Str = FR_I18N['zh_CN'][Key];
+            if (Str === undefined) return Key;
+            for (let I = 0; I < Args.length; I++) {
+                Str = Str.replace('{' + I + '}', Args[I]);
+            }
+            return Str;
+        }
+
         // ======================== 常量 ========================
         const SEL_LIST = '.space-favlist';              // observer 挂载点（页面根级容器）
         const SEL_ITEM = '.items__item';                // 单视频卡片
@@ -205,7 +321,7 @@
                 }
             });
             Observer.observe(Root, { childList: true, subtree: true, attributes: false });
-            Log('Observer 已启动，挂载点:', Root);
+            Log(FR_T('LogObserverStarted'), Root);
         }
     
         function StopObserver() {
@@ -300,7 +416,7 @@
                 }
                 const Btn = document.createElement('button');
                 Btn.className = 'favrename-btn';
-                Btn.textContent = '改名';
+                Btn.textContent = FR_T('BtnRename');
                 Btn.addEventListener('click', function() { openEditRow(Entry, Item); });
                 Entry.appendChild(Title);
                 Entry.appendChild(Btn);
@@ -309,7 +425,7 @@
             if (!Count) {
                 const Empty = document.createElement('div');
                 Empty.className = 'favrename-empty';
-                Empty.textContent = '当前页面没有已加载的视频，滚动页面加载后自动同步';
+                Empty.textContent = FR_T('EmptyList');
                 Body.appendChild(Empty);
             }
         }
@@ -322,10 +438,10 @@
             Input.value = getRenames()[Item.bvid] || Item.origTitle;
             const Ok = document.createElement('button');
             Ok.className = 'favrename-btn';
-            Ok.textContent = '确定';
+            Ok.textContent = FR_T('BtnOK');
             const Cancel = document.createElement('button');
             Cancel.className = 'favrename-btn';
-            Cancel.textContent = '取消';
+            Cancel.textContent = FR_T('BtnCancel');
             Ok.addEventListener('click', function() {
                 renameEntry(Item.bvid, Input.value);
                 renderList(getFilterValue());
@@ -371,18 +487,18 @@
             Title.textContent = 'BiliFavRename';
             const Search = document.createElement('input');
             Search.className = 'favrename-search';
-            Search.placeholder = '搜索视频标题';
+            Search.placeholder = FR_T('SearchPlaceholder');
             Search.addEventListener('input', function() { renderList(Search.value); });
             const Collapse = document.createElement('button');
             Collapse.className = 'favrename-btn';
-            Collapse.textContent = '折叠';
+            Collapse.textContent = FR_T('BtnCollapse');
             Collapse.addEventListener('click', function() {
                 const Collapsed = PanelEl.classList.toggle('favrename-collapsed');
-                Collapse.textContent = Collapsed ? '展开' : '折叠';
+                Collapse.textContent = Collapsed ? FR_T('BtnExpand') : FR_T('BtnCollapse');
             });
             const Close = document.createElement('button');
             Close.className = 'favrename-btn';
-            Close.textContent = '关闭';
+            Close.textContent = FR_T('BtnClose');
             Close.addEventListener('click', function() {
                 PanelEl.remove();
                 PanelEl = null;
@@ -457,11 +573,11 @@
         }
     
         function clearAllRenames() {
-            if (!confirm('确定清空全部重命名映射？此操作不可撤销。')) return;
+            if (!confirm(FR_T('ConfirmClearAll'))) return;
             GM_setValue(KEY_RENAMES, {});
             document.querySelectorAll(SEL_ITEM).forEach(function(Item) { revertTitle(Item); });
             CARD_LIST = [];
-            Log('已清空全部重命名映射');
+            Log(FR_T('LogCleared'));
         }
     
         function OpenSettings() {
@@ -472,10 +588,10 @@
             const Head = document.createElement('div');
             Head.className = 'favrename-settings-head';
             const HeadTitle = document.createElement('span');
-            HeadTitle.textContent = 'BiliFavRename 设置';
+            HeadTitle.textContent = FR_T('SettingsTitle');
             const Close = document.createElement('button');
             Close.className = 'favrename-btn';
-            Close.textContent = '关闭';
+            Close.textContent = FR_T('BtnClose');
             Close.addEventListener('click', function() {
                 SettingsEl.remove();
                 SettingsEl = null;
@@ -488,7 +604,7 @@
             const RowMarker = document.createElement('div');
             RowMarker.className = 'favrename-settings-row';
             const LabelMarker = document.createElement('label');
-            LabelMarker.textContent = '弱标记字符（留空为不标记）';
+            LabelMarker.textContent = FR_T('LabelMarker');
             const MarkerInput = document.createElement('input');
             MarkerInput.className = 'favrename-marker';
             MarkerInput.value = S.marker;
@@ -505,7 +621,7 @@
             const RowToggle = document.createElement('div');
             RowToggle.className = 'favrename-settings-row';
             const LabelToggle = document.createElement('label');
-            LabelToggle.textContent = '启用重命名';
+            LabelToggle.textContent = FR_T('LabelToggle');
             const Toggle = document.createElement('input');
             Toggle.type = 'checkbox';
             Toggle.checked = !!S.enabled;
@@ -522,7 +638,7 @@
             RowClear.className = 'favrename-settings-row';
             const ClearBtn = document.createElement('button');
             ClearBtn.className = 'favrename-btn favrename-danger';
-            ClearBtn.textContent = '清空全部映射';
+            ClearBtn.textContent = FR_T('BtnClearAll');
             ClearBtn.addEventListener('click', function() {
                 clearAllRenames();
                 if (PanelEl) renderList(getFilterValue());
@@ -535,8 +651,8 @@
     
         // ======================== 菜单注册与初始化 ========================
         function RegisterMenu() {
-            GM_registerMenuCommand('打开重命名面板', OpenPanel);
-            GM_registerMenuCommand('设置', OpenSettings);
+            GM_registerMenuCommand(FR_T('MenuOpenPanel'), OpenPanel);
+            GM_registerMenuCommand(FR_T('MenuSettings'), OpenSettings);
         }
     
         // 是否处于收藏夹页（SPA 路由，pathname 含 /favlist）
@@ -563,13 +679,14 @@
         }
     
         // 初始化：脚本 match 整个空间站，仅在收藏夹页启动替换
+        FR_Lang = ResolveUILang();  // 解析语言（必须在任何 FR_T() 调用之前）
         RegisterMenu();
         WatchUrlChange();
         if (isFavlistPage()) {
             ApplyAll();
-            Log('BiliFavRename 已初始化（收藏夹页）');
+            Log(FR_T('LogInitFav'));
         } else {
-            Log('BiliFavRename 已初始化（空间页，进入收藏夹后启动）');
+            Log(FR_T('LogInitSpace'));
         }
     }
 
@@ -633,7 +750,21 @@
                 PanelColorAuto: '跟随系统',
                 PanelColorDark: '深色',
                 PanelColorLight: '浅色',
-    
+                PanelRemovalSection: '去除元素',
+                RmCarousel: '首页轮播图',
+                RmRightChannel: '右侧频道导航',
+                RmChannelIcons: '频道图标行',
+                RmChannelBar: '频道栏（整体）',
+                RmCreationEntry: '创作中心入口',
+                RmUploadEntry: '投稿入口',
+                RmLiveEntry: '直播入口',
+                RmDynamicEntry: '动态入口',
+                RmVipEntry: '大会员VIP',
+                RmAdblockTips: '广告提示条',
+                RmLeftEntries: '左侧全部入口',
+                RmPaletteBtn: '调色板浮窗',
+                RmSpaceNotif: '空间-消息通知',
+
                 // Prompt
                 PromptQuickSet: '输入最大显示视频数量（1-100）：',
             },
@@ -691,7 +822,21 @@
                 PanelColorAuto: '跟隨系統',
                 PanelColorDark: '深色',
                 PanelColorLight: '淺色',
-    
+                PanelRemovalSection: '去除元素',
+                RmCarousel: '首頁輪播圖',
+                RmRightChannel: '右側頻道導航',
+                RmChannelIcons: '頻道圖示列',
+                RmChannelBar: '頻道列（整體）',
+                RmCreationEntry: '創作中心入口',
+                RmUploadEntry: '投稿入口',
+                RmLiveEntry: '直播入口',
+                RmDynamicEntry: '動態入口',
+                RmVipEntry: '大會員VIP',
+                RmAdblockTips: '廣告提示列',
+                RmLeftEntries: '左側全部入口',
+                RmPaletteBtn: '調色板浮窗',
+                RmSpaceNotif: '空間-訊息通知',
+
                 // Prompt
                 PromptQuickSet: '輸入最大顯示影片數量（1-100）：',
             },
@@ -716,6 +861,9 @@
                 LogInitError: 'Initialization failed:',
                 LogObserverStarted: 'MutationObserver started, watching container:',
                 LogUrlChanged: 'URL changed:',
+                LogPurifierStarted: 'Comment purifier started',
+                LogPurifierBlockerCompat: ' (BilibiliBlocker detected, compatibility mode)',
+                LogPurifierStopped: 'Comment purifier stopped',
     
                 // Menu
                 MenuSettings: 'BiliCompact Settings',
@@ -749,9 +897,98 @@
                 PanelColorAuto: 'Auto (System)',
                 PanelColorDark: 'Dark',
                 PanelColorLight: 'Light',
-    
+                PanelRemovalSection: 'Element Removal',
+                RmCarousel: 'Homepage carousel',
+                RmRightChannel: 'Right channel navigation',
+                RmChannelIcons: 'Channel icons row',
+                RmChannelBar: 'Channel bar (whole)',
+                RmCreationEntry: 'Creator center entry',
+                RmUploadEntry: 'Upload entry',
+                RmLiveEntry: 'Live entry',
+                RmDynamicEntry: 'Dynamic entry',
+                RmVipEntry: 'VIP badge',
+                RmAdblockTips: 'Ad block warning bar',
+                RmLeftEntries: 'All left entries',
+                RmPaletteBtn: 'Palette button',
+                RmSpaceNotif: 'Space - notifications',
+
                 // Prompt
                 PromptQuickSet: 'Enter max videos to show (1-100):',
+            },
+            ja_JP: {
+                // Log
+                LogPrefix: '[BiliCompact]',
+                LogSelectorData: 'data属性からセレクターを検出:',
+                LogSelectorFound: 'セレクターを検出:',
+                LogSelectorFallback: 'リンクからフォールバックしてセレクターを検出:',
+                LogNoCards: '動画カードが見つかりません。スキップします',
+                LogStillNoCards: '動画カードがまだ見つかりません',
+                LogProcessed: '処理完了: 全動画 {0}, 表示 {1}, 非表示 {2}',
+                LogErrorLimit: 'limitVideos エラー:',
+                LogContainerFound: 'コンテナーを検出:',
+                LogConfigLoaded: '設定を読み込みました:',
+                LogStatus: '簡素化ステータス: {0}',
+                LogStatusOn: '有効',
+                LogStatusOff: '無効',
+                LogQuickSet: '最大件数を設定しました:',
+                LogTimerRetry: 'タイマーが表示動画の過多を検出したため、制限を再実行します',
+                LogInitDone: 'BiliCompact 初期化完了（非侵入型）、現在の設定:',
+                LogInitError: '初期化に失敗:',
+                LogObserverStarted: 'MutationObserver を起動、監視コンテナー:',
+                LogUrlChanged: 'URL変更:',
+                LogPurifierStarted: 'コメント浄化を開始しました',
+                LogPurifierBlockerCompat: '（BilibiliBlocker 検出、互換モード）',
+                LogPurifierStopped: 'コメント浄化を停止しました',
+
+                // Menu
+                MenuSettings: 'BiliCompact設定',
+                MenuRefresh: '簡素化を再実行',
+                MenuToggle: '簡素化のオン/オフ',
+                MenuQuickSet: '件数をすばやく設定',
+                MenuCommentPurifier: 'コメント浄化の切り替え',
+
+                // Panel
+                PanelTitle: 'BiliCompact設定',
+                PanelStatusLabel: '現在の状態',
+                PanelStatusActive: '簡素化中',
+                PanelStatusPaused: '一時停止中',
+                PanelMaxVideos: '最大表示件数',
+                PanelExcludeLive: 'ライブ配信を除外',
+                PanelExcludeAd: '広告を除外',
+                PanelExcludeBangumi: 'バングミを除外',
+                PanelExcludePaid: '有料コースを除外',
+                PanelKeepPromoted: 'プロモーションを保持（件数に含めない）',
+                PanelKeepUpids: '投稿者IDを保持（カンマ区切り）',
+                PanelDebug: 'デバッグモード',
+                PanelEnableCommentPurifier: 'コメント浄化を有効化（@メンションを削除、短文コメントを非表示）',
+                PanelLanguage: '言語 / Language',
+                PanelLanguageAuto: '自動 (Auto)',
+                PanelBtnPause: '一時停止',
+                PanelBtnResume: '再開',
+                PanelBtnReset: '初期設定に戻す',
+                PanelBtnSave: '保存して適用',
+                PanelBtnClose: '閉じる',
+                PanelColorMode: 'カラーモード',
+                PanelColorAuto: 'システムに従う',
+                PanelColorDark: 'ダーク',
+                PanelColorLight: 'ライト',
+                PanelRemovalSection: '要素の除去',
+                RmCarousel: 'トップページのカルーセル',
+                RmRightChannel: '右側のチャンネルナビ',
+                RmChannelIcons: 'チャンネルアイコン列',
+                RmChannelBar: 'チャンネルバー（全体）',
+                RmCreationEntry: '創作センター入口',
+                RmUploadEntry: '投稿入口',
+                RmLiveEntry: 'ライブ配信入口',
+                RmDynamicEntry: '動態入口',
+                RmVipEntry: '大会員VIP',
+                RmAdblockTips: '広告警告バー',
+                RmLeftEntries: '左側の全入口',
+                RmPaletteBtn: 'パレット浮窓',
+                RmSpaceNotif: 'スペース-お知らせ',
+
+                // Prompt
+                PromptQuickSet: '表示する最大動画数を入力してください（1-100）：',
             }
         };
     
@@ -762,11 +999,7 @@
             if (Config.Language && Config.Language !== 'auto') {
                 return Config.Language;
             }
-            const Nav = (navigator.language || '').toLowerCase();
-            if (/^zh-(tw|hk|mo)$/i.test(Nav) || /^zh-(hant)$/i.test(Nav)) return 'zh_TW';
-            if (/^zh/i.test(Nav)) return 'zh_CN';
-            if (/^en/i.test(Nav)) return 'en_US';
-            return 'zh_CN'; // fallback
+            return ResolveUILang();
         }
     
         function T(Key, ...Args) {
@@ -793,7 +1026,7 @@
             ExcludePaid: true,            // 排除付费课程
             KeepSpecialUPIDs: [],         // 保留的UP主ID列表（数字）
             KeepPromoted: false,          // 保留推广位（不计入数量）
-            Language: 'auto',             // 界面语言: auto | zh_CN | zh_TW | en_US
+            Language: 'auto',             // 界面语言: auto | zh_CN | zh_TW | en_US | ja_JP
             Debug: false,                 // 调试模式
             EnableCommentPurifier: false, // 评论净化器 (删除@提及，隐藏短评论)
             RemovedElements: {},          // 元素去除: { presetId: true/false }
@@ -972,7 +1205,7 @@
             purifierFindRenderers().forEach(purifierProcessRenderer);
     
             const hasBlocker = purifierHasBlockerInstalled();
-            Log('评论净化器已启动' + (hasBlocker ? '（检测到 BilibiliBlocker，兼容模式）' : ''));
+            Log(T('LogPurifierStarted') + (hasBlocker ? T('LogPurifierBlockerCompat') : ''));
         }
     
         /**
@@ -986,7 +1219,7 @@
                 try { obs.disconnect(); } catch (_) {}
             }
             PurifierObservers = [];
-            Log('评论净化器已停止');
+            Log(T('LogPurifierStopped'));
         }
     
         /**
@@ -1120,6 +1353,12 @@
             }
         ];
     
+        // 预设显示名的 i18n 键：id kebab-case → 'Rm' + PascalCase（如 'right-channel' → 'RmRightChannel'）
+        // 与 I18N 字典中 Rm* 键一一对应；P.name 保留作为预设自身的可读说明
+        function RmNameKey(Id) {
+            return 'Rm' + Id.split('-').map(function(W) { return W.charAt(0).toUpperCase() + W.slice(1); }).join('');
+        }
+
         let ElementRemovalStates = {};  // { presetId: { element, originalDisplay } }
     
         /**
@@ -1812,6 +2051,7 @@
                 { Value: 'zh_CN', Label: '简体中文' },
                 { Value: 'zh_TW', Label: '繁體中文' },
                 { Value: 'en_US', Label: 'English' },
+                { Value: 'ja_JP', Label: '日本語' },
             ];
             const LangSelectHTML = LangOptions.map(Opt =>
                 `<option value="${Opt.Value}" ${Config.Language === Opt.Value ? 'selected' : ''}>${Opt.Label}</option>`
@@ -1841,11 +2081,11 @@
                 <hr style="margin:8px 0;border:none;border-top:1px solid var(--hr, #333)">
                 <div class="CollapseHeader" id="CfgCollapseRm">
                     <span class="CollapseArrow" id="CfgCollapseRmArrow">▸</span>
-                    <span>${'去除元素'}</span>
+                    <span>${T('PanelRemovalSection')}</span>
                 </div>
                 <div class="CollapseContent collapsed" id="CfgCollapseRmContent">
                 ${ELEMENT_REMOVAL_PRESETS.map(function(P) {
-                    return '<label><span style="flex:1">' + P.name + '</span> <input type="checkbox" id="CfgRm_' + P.id + '" ' + ((Config.RemovedElements || {})[P.id] ? 'checked' : '') + '></label>';
+                    return '<label><span style="flex:1">' + T(RmNameKey(P.id)) + '</span> <input type="checkbox" id="CfgRm_' + P.id + '" ' + ((Config.RemovedElements || {})[P.id] ? 'checked' : '') + '></label>';
                 }).join('')}
                 </div>
                 <div class="BtnRow">
