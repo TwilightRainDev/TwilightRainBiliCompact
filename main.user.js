@@ -4,7 +4,7 @@
 // @name:zh-TW   網頁端Bilibili主頁精簡~ BiliCompact
 // @name:ja      Web版Bilibiliのhomepageの簡素化
 // @namespace    http://tampermonkey.net/
-// @version      2.9.1
+// @version      2.9.2
 // @license MIT
 // @description  Tired of Bilibili's cluttered video feed? This plugin limits visible videos per page, supports multi‑page, black/whitelists, and persistent settings. No UI injected, 4 languages supported. Locally, there are 0 network requests.
 // @description:zh-CN   厌倦网页视频过多？本插件限制显示数量，支持多页、黑白名单、持久配置。无UI注入，四语言。收藏夹本地重命名，零网络请求。
@@ -2283,7 +2283,9 @@ if (typeof module !== 'undefined' && module.exports) {
             InjectPanelStyles();
 
             // 外壳交给共享工厂：主题按 Config.ColorMode（auto 跟随系统，打开时计算一次）
-            const PanelHandle = createBcPanel({ overlay: true, theme: 'config', colorMode: Config.ColorMode });
+            // 必须传 className: 'BiliCompactPanel' —— InjectPanelStyles 的布局 CSS 全部以此类为前缀，
+            // 缺类会导致 label 挤行、面板宽度失控（max-width 失效）、BtnRow/StatusBadge 无样式
+            const PanelHandle = createBcPanel({ overlay: true, theme: 'config', colorMode: Config.ColorMode, className: 'BiliCompactPanel' });
             const Overlay = PanelHandle.overlay;
             const Panel = PanelHandle.el;
     
