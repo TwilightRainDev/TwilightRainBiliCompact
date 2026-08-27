@@ -4,7 +4,7 @@
 // @name:zh-TW   網頁端Bilibili主頁精簡~ BiliCompact
 // @name:ja      Web版Bilibiliのhomepageの簡素化
 // @namespace    http://tampermonkey.net/
-// @version      2.9.2
+// @version      2.10.0
 // @license MIT
 // @description  Tired of Bilibili's cluttered video feed? This plugin limits visible videos per page, supports multi‑page, black/whitelists, and persistent settings. No UI injected, 4 languages supported. Locally, there are 0 network requests.
 // @description:zh-CN   厌倦网页视频过多？本插件限制显示数量，支持多页、黑白名单、持久配置。无UI注入，四语言。收藏夹本地重命名，零网络请求。
@@ -65,12 +65,13 @@ var CommentRuleEngine = (function() {
         }
         return null;
     }
-    function regexMatch(ruleList, value) {
+    function regexMatch(ruleList, value, caseInsensitive) {
         if (!Array.isArray(ruleList) || ruleList.length === 0) return { hit: null, error: null };
         var Cleaned = String(value).split(/[\t\r\f\n\s]*/g).join('');
         for (var i = 0; i < ruleList.length; i++) {
             try {
-                if (Cleaned.search(ruleList[i]) !== -1) return { hit: ruleList[i], error: null };
+                // caseInsensitive 时编译加 i 标志（预设方案用；手动屏蔽正则保持区分大小写）
+                if (Cleaned.search(new RegExp(ruleList[i], caseInsensitive ? 'i' : '')) !== -1) return { hit: ruleList[i], error: null };
             } catch (E) {
                 // 单条正则错误：跳过，不中断其他规则（对齐 Blocker 的 try/catch 语义）
                 if (typeof console !== 'undefined') console.warn('[BiliCompact] 正则规则异常，已跳过: ' + ruleList[i], E);
@@ -106,7 +107,30 @@ var CommentRuleEngine = (function() {
         }
         return { state: false };
     }
-    return { fuzzyMatch: fuzzyMatch, regexMatch: regexMatch, blockComment: blockComment, replaceKeywords: replaceKeywords, replaceEmoticons: replaceEmoticons };
+    function replaceRegex(arr, content) {
+        // 正则替换/删除：逐条编译（u 标志支持 \p{...} 属性转义；V.ci 时大小写不敏感），
+        // 全部命中规则依次应用（每条替换全部出现），空替换 = 删除；单条异常跳过并记日志。
+        if (!Array.isArray(arr) || arr.length === 0 || !content) return { state: false };
+        var Out = String(content), Changed = false;
+        for (var i = 0; i < arr.length; i++) {
+            var V = arr[i];
+            if (!V || !V.find) continue;
+            var Re = null;
+            try { Re = new RegExp(V.find, V.ci ? 'giu' : 'gu'); }
+            catch (E1) {
+                // 旧引擎兼容：u 标志对个别遗留写法（如未转义 { ）报错时回退无 u 编译
+                try { Re = new RegExp(V.find, V.ci ? 'gi' : 'g'); }
+                catch (E2) {
+                    if (typeof console !== 'undefined') console.warn('[BiliCompact] 正则替换规则异常，已跳过: ' + V.find, E2);
+                    continue;
+                }
+            }
+            var New = Out.replace(Re, V.replace || '');
+            if (New !== Out) { Out = New; Changed = true; }
+        }
+        return Changed ? { state: true, content: Out } : { state: false };
+    }
+    return { fuzzyMatch: fuzzyMatch, regexMatch: regexMatch, blockComment: blockComment, replaceKeywords: replaceKeywords, replaceEmoticons: replaceEmoticons, replaceRegex: replaceRegex };
 })();
 
 // ======================== 共享面板主题（两模块统一，面板元素打 data-bc-theme 属性） ========================
@@ -546,13 +570,12 @@ if (typeof module !== 'undefined' && module.exports) {
         // 主题变量与基础控件由共享 PANEL_THEME_CSS 提供（data-bc-theme 属性由工厂打上）；
         // 此处仅保留布局与列表专属样式。
         GM_addStyle(`
-            #favrename-panel, #favrename-settings {
+            #favrename-panel {
                 position: fixed; top: 50%; left: 50%;
                 transform: translate(-50%, -50%);
                 z-index: 99999;
             }
             #favrename-panel { width: 340px; }
-            #favrename-settings { width: 300px; max-height: 80vh; overflow-y: auto; }
             /* 面板主体复用共享折叠结构（bc-collapse-content），去掉 flex gap 保持列表原有分隔 */
             #favrename-panel .favrename-panel-body.bc-collapse-content { gap: 0; }
             #favrename-panel .favrename-panel-head {
@@ -576,12 +599,11 @@ if (typeof module !== 'undefined' && module.exports) {
                 border-color: var(--accent); /* 行内编辑输入框用强调色边框，与普通输入区分 */
             }
             #favrename-panel .favrename-empty { padding: 16px 12px; color: var(--text-secondary); text-align: center; }
-            #favrename-settings .favrename-settings-head {
-                display: flex; align-items: center; justify-content: space-between;
-                padding: 10px 12px; border-bottom: 1px solid var(--border); font-weight: bold;
-            }
-            #favrename-settings .bc-row label { flex: 1; }
-            #favrename-settings .favrename-marker {
+            /* 设置区块（并入面板，位于列表上方）：折叠头复用 bc-collapse-header，
+               设置行复用 .bc-row；bc-collapse-content 默认 flex column，去掉 gap 保持行分隔 */
+            #favrename-panel .favrename-settings-body.bc-collapse-content { gap: 0; }
+            #favrename-panel .favrename-settings-body .bc-row label { flex: 1; }
+            #favrename-panel .favrename-marker {
                 width: 48px; text-align: center;
             }
         `);
@@ -722,14 +744,78 @@ if (typeof module !== 'undefined' && module.exports) {
             Head.appendChild(Search);
             Head.appendChild(Close);
             PanelEl.appendChild(Head);
+
+            // 设置区块（并入面板，位于列表上方；默认收起，菜单「设置」可展开）
+            const S = getSettings();
+            const SettingsHead = document.createElement('div');
+            SettingsHead.className = 'bc-collapse-header';
+            SettingsHead.style.flex = '0 0 auto';
+            const SettingsArrow = document.createElement('span');
+            SettingsArrow.className = 'bc-collapse-arrow';
+            SettingsArrow.textContent = ' > ';
+            const SettingsTitleEl = document.createElement('span');
+            SettingsTitleEl.textContent = FR_T('SettingsTitle');
+            SettingsHead.appendChild(SettingsArrow);
+            SettingsHead.appendChild(SettingsTitleEl);
+            const SettingsBody = document.createElement('div');
+            SettingsBody.className = 'favrename-settings-body bc-collapse-content collapsed';
+            SettingsHead.addEventListener('click', function() {
+                const Collapsed = SettingsBody.classList.toggle('collapsed');
+                SettingsArrow.classList.toggle('open', !Collapsed);
+            });
+            PanelEl.appendChild(SettingsHead);
+            PanelEl.appendChild(SettingsBody);
+
+            // 弱标记字符
+            const RowMarker = document.createElement('div');
+            RowMarker.className = 'bc-row';
+            const LabelMarker = document.createElement('label');
+            LabelMarker.textContent = FR_T('LabelMarker');
+            const MarkerInput = document.createElement('input');
+            MarkerInput.className = 'bc-input favrename-marker';
+            MarkerInput.value = S.marker;
+            MarkerInput.maxLength = 4;
+            MarkerInput.addEventListener('change', function() {
+                setMarker(MarkerInput.value);
+                renderList(getFilterValue());
+            });
+            RowMarker.appendChild(LabelMarker);
+            RowMarker.appendChild(MarkerInput);
+            SettingsBody.appendChild(RowMarker);
+
+            // 总开关
+            const RowToggle = document.createElement('div');
+            RowToggle.className = 'bc-row';
+            const LabelToggle = document.createElement('label');
+            LabelToggle.textContent = FR_T('LabelToggle');
+            const Toggle = document.createElement('input');
+            Toggle.type = 'checkbox';
+            Toggle.checked = !!S.enabled;
+            Toggle.addEventListener('change', function() {
+                setEnabled(Toggle.checked);
+                renderList(getFilterValue());
+            });
+            RowToggle.appendChild(LabelToggle);
+            RowToggle.appendChild(Toggle);
+            SettingsBody.appendChild(RowToggle);
+
+            // 清空全部映射
+            const RowClear = document.createElement('div');
+            RowClear.className = 'bc-row';
+            const ClearBtn = document.createElement('button');
+            ClearBtn.className = 'bc-btn bc-btn-danger';
+            ClearBtn.textContent = FR_T('BtnClearAll');
+            ClearBtn.addEventListener('click', function() {
+                clearAllRenames();
+                renderList(getFilterValue());
+            });
+            RowClear.appendChild(ClearBtn);
+            SettingsBody.appendChild(RowClear);
+
             PanelEl.appendChild(Body);
             renderList('');
         }
-    
-        // ======================== 设置面板 ========================
-        let SettingsEl = null;
-        let SettingsHandle = null;  // 共享工厂句柄
-    
+
         // 弱标记字符修改后，对已应用卡片重跑替换
         function setMarker(Char) {
             const S = getSettings();
@@ -765,80 +851,25 @@ if (typeof module !== 'undefined' && module.exports) {
             Log(FR_T('LogCleared'));
         }
     
-        function OpenSettings() {
-            if (SettingsEl) { SettingsEl.remove(); SettingsEl = null; }
-            if (SettingsHandle) { SettingsHandle.destroy(); SettingsHandle = null; }
-            const S = getSettings();
-            // 外壳交给共享工厂：主题跟随系统（system）并实时监听切换（live）
-            SettingsHandle = createBcPanel({ id: 'favrename-settings', theme: 'system', live: true });
-            SettingsEl = SettingsHandle.el;
-            const Head = document.createElement('div');
-            Head.className = 'favrename-settings-head';
-            const HeadTitle = document.createElement('span');
-            HeadTitle.textContent = FR_T('SettingsTitle');
-            const Close = document.createElement('button');
-            Close.className = 'bc-btn';
-            Close.textContent = FR_T('BtnClose');
-            Close.addEventListener('click', function() {
-                SettingsHandle.destroy();
-                SettingsEl = null;
-                SettingsHandle = null;
-            });
-            Head.appendChild(HeadTitle);
-            Head.appendChild(Close);
-            SettingsEl.appendChild(Head);
-
-            // 弱标记字符
-            const RowMarker = document.createElement('div');
-            RowMarker.className = 'bc-row';
-            const LabelMarker = document.createElement('label');
-            LabelMarker.textContent = FR_T('LabelMarker');
-            const MarkerInput = document.createElement('input');
-            MarkerInput.className = 'bc-input favrename-marker';
-            MarkerInput.value = S.marker;
-            MarkerInput.maxLength = 4;
-            MarkerInput.addEventListener('change', function() {
-                setMarker(MarkerInput.value);
-                if (PanelEl) renderList(getFilterValue());
-            });
-            RowMarker.appendChild(LabelMarker);
-            RowMarker.appendChild(MarkerInput);
-            SettingsEl.appendChild(RowMarker);
-
-            // 总开关
-            const RowToggle = document.createElement('div');
-            RowToggle.className = 'bc-row';
-            const LabelToggle = document.createElement('label');
-            LabelToggle.textContent = FR_T('LabelToggle');
-            const Toggle = document.createElement('input');
-            Toggle.type = 'checkbox';
-            Toggle.checked = !!S.enabled;
-            Toggle.addEventListener('change', function() {
-                setEnabled(Toggle.checked);
-                if (PanelEl) renderList(getFilterValue());
-            });
-            RowToggle.appendChild(LabelToggle);
-            RowToggle.appendChild(Toggle);
-            SettingsEl.appendChild(RowToggle);
-
-            // 清空全部映射
-            const RowClear = document.createElement('div');
-            RowClear.className = 'bc-row';
-            const ClearBtn = document.createElement('button');
-            ClearBtn.className = 'bc-btn bc-btn-danger';
-            ClearBtn.textContent = FR_T('BtnClearAll');
-            ClearBtn.addEventListener('click', function() {
-                clearAllRenames();
-                if (PanelEl) renderList(getFilterValue());
-            });
-            RowClear.appendChild(ClearBtn);
-            SettingsEl.appendChild(RowClear);
+        // 展开设置区块（面板内）；供菜单「设置」调用
+        function ExpandSettings() {
+            if (!PanelEl) return;
+            const SB = PanelEl.querySelector('.favrename-settings-body');
+            const SA = PanelEl.querySelector('.favrename-settings-arrow');
+            if (SB) SB.classList.remove('collapsed');
+            if (SA) SA.classList.add('open');
         }
-    
+
+        // 菜单「设置」：打开面板并展开设置区块
+        function OpenPanelWithSettings() {
+            if (!PanelEl) OpenPanel();
+            ExpandSettings();
+        }
+
         // ======================== 菜单注册与初始化 ========================
         function RegisterMenu() {
             GM_registerMenuCommand(FR_T('MenuOpenPanel'), OpenPanel);
-            GM_registerMenuCommand(FR_T('MenuSettings'), OpenSettings);
+            GM_registerMenuCommand(FR_T('MenuSettings'), OpenPanelWithSettings);
         }
     
         // 是否处于收藏夹页（SPA 路由，pathname 含 /favlist）
@@ -939,6 +970,14 @@ if (typeof module !== 'undefined' && module.exports) {
                 ClearEmoticons: '清除评论全部表情',
                 ReplaceSearchTerms: '搜索跳转词转普通文本',
                 PurifierSectionHint: '规则保存后立即对已加载评论生效',
+                RegexReplaceLabel: '正则替换（每行一条：正则=>替换词，留空删除）',
+                RegexPresetSection: '预设方案（勾选即生效，命中即隐藏整条评论；大小写不敏感）',
+                RegexPresetSpam: '营销广告词',
+                RegexPresetMeme: '低质梗评论',
+                RegexPresetPunch: '打卡式评论（独立短句）',
+                RegexPresetEditHint: '点击栏目名展开，可查看并编辑该预设的正则内容',
+                RegexPresetReset: '恢复默认',
+                RegexReplaceHint: '正则直接匹配原文（不去空白）、区分大小写；需开启「启用内容替换」',
                 PurifierTutorial: '用法：模糊词与正则每行一条，命中即整条评论隐藏；正则写错自动跳过（控制台提示）。替换规则 关键词=>替换词；表情替换留空=删除图片。示例正则：\\d{8,} 屏蔽超长数字评论。',
                 PanelLanguage: '界面语言 / Language',
                 PanelLanguageAuto: '自动 (Auto)',
@@ -1026,6 +1065,14 @@ if (typeof module !== 'undefined' && module.exports) {
                 ClearEmoticons: '清除評論全部表情',
                 ReplaceSearchTerms: '搜尋跳轉詞轉普通文字',
                 PurifierSectionHint: '規則儲存後立即對已載入評論生效',
+                RegexReplaceLabel: '正則替換（每行一條：正則=>替換詞，留空刪除）',
+                RegexPresetSection: '預設方案（勾選即生效，命中即隱藏整條評論；大小寫不敏感）',
+                RegexPresetSpam: '行銷廣告詞',
+                RegexPresetMeme: '低質梗評論',
+                RegexPresetPunch: '打卡式評論（獨立短句）',
+                RegexPresetEditHint: '點擊欄目名展開，可查看並編輯該預設的正則內容',
+                RegexPresetReset: '回復預設',
+                RegexReplaceHint: '正則直接匹配原文（不去空白）、區分大小寫；需開啟「啟用內容替換」',
                 PurifierTutorial: '用法：模糊詞與正則每行一條，命中即整條評論隱藏；正則寫錯自動跳過（主控台提示）。替換規則 關鍵詞=>替換詞；表情替換留空=刪除圖片。範例正則：\\d{8,} 屏蔽超長數字評論。',
                 PanelLanguage: '介面語言 / Language',
                 PanelLanguageAuto: '自動 (Auto)',
@@ -1113,6 +1160,14 @@ if (typeof module !== 'undefined' && module.exports) {
                 ClearEmoticons: 'Clear all emoticons',
                 ReplaceSearchTerms: 'Search terms → plain text',
                 PurifierSectionHint: 'Rules apply to loaded comments after save',
+                RegexReplaceLabel: 'Regex replace (one per line: regex=>replacement, empty deletes)',
+                RegexPresetSection: 'Presets (check to enable; a hit hides the whole comment; case-insensitive)',
+                RegexPresetSpam: 'Spam & promo keywords',
+                RegexPresetMeme: 'Low-effort meme comments',
+                RegexPresetPunch: 'Check-in comments (standalone phrases)',
+                RegexPresetEditHint: 'Click a preset name to expand, view, and edit its regex',
+                RegexPresetReset: 'Reset to default',
+                RegexReplaceHint: 'Regex matches raw text (whitespace kept), case-sensitive; requires "Enable content replacement"',
                 PurifierTutorial: 'Usage: fuzzy words and regexes are one per line; a match hides the whole comment. Invalid regexes are skipped with a console warning. Replacement: keyword=>replacement; emoticon replacement empty = delete image. Example regex: \\d{8,} hides comments with long digit runs.',
                 PanelLanguage: 'Language / 語言',
                 PanelLanguageAuto: 'Auto',
@@ -1200,6 +1255,14 @@ if (typeof module !== 'undefined' && module.exports) {
                 ClearEmoticons: 'コメントの絵文字を全削除',
                 ReplaceSearchTerms: '検索リンクを通常テキスト化',
                 PurifierSectionHint: '保存後、読み込み済みコメントへ即時反映',
+                RegexReplaceLabel: '正規表現置換（1行1件：正則=>置換語、空欄は削除）',
+                RegexPresetSection: 'プリセット（チェックで有効化、一致でコメント全体を非表示；大小文字不区別）',
+                RegexPresetSpam: '広告・プロモーション語',
+                RegexPresetMeme: '低質ネタコメント',
+                RegexPresetPunch: 'チェックイン系コメント（単独文）',
+                RegexPresetEditHint: '欄名をクリックして展開し、正規表現の確認・編集ができます',
+                RegexPresetReset: '既定値に戻す',
+                RegexReplaceHint: '正規表現は原文そのまま（空白除去なし）で大小文字を区別；「内容置換を有効化」が必要',
                 PurifierTutorial: '使い方: キーワードと正規表現は1行1件、一致するとコメント全体を非表示にします。不正な正規表現はスキップされコンソールに警告が出ます。置換: 語=>置換語; 絵文字置換の空欄は画像削除。例: \\d{8,} は長い数字列を非表示にします。',
                 PanelLanguage: '言語 / Language',
                 PanelLanguageAuto: '自動 (Auto)',
@@ -1258,6 +1321,9 @@ if (typeof module !== 'undefined' && module.exports) {
         }
     
         // ======================== 配置（默认值，会从GM存储读取） ========================
+        // 预设方案 id → 配置键 / i18n 标签键（规则内容用户可编辑，存于 Config）
+        const REGEX_PRESET_KEYS = { spam: 'PresetSpam', meme: 'PresetMeme', punch: 'PresetPunch' };
+        const PRESET_LABEL_KEYS = { spam: 'RegexPresetSpam', meme: 'RegexPresetMeme', punch: 'RegexPresetPunch' };
         const DEFAULTS = {
             MaxVideos: 10,                 // 最大显示数量
             ExcludeLive: true,             // 排除直播
@@ -1269,9 +1335,15 @@ if (typeof module !== 'undefined' && module.exports) {
             Language: 'auto',             // 界面语言: auto | zh_CN | zh_TW | en_US | ja_JP
             Debug: false,                 // 调试模式
             EnableCommentPurifier: false, // 评论净化器 (删除@提及，隐藏短评论)
+            // 正则预设方案（勾选 enabled 即生效，命中即隐藏整条评论；大小写不敏感，去空白后匹配）
+            // rule 为用户可编辑的正则内容；DEFAULTS 即出厂默认，面板「恢复默认」按钮取此处值
+            PresetSpam: { enabled: false, rule: '心流AI助手|Vinsight|传智AI|MilkyAi|UP主加油！看好你噢|求文档|已私|求私|提醒我回来看|回来刷播放|传说榜|给我喜欢的人表白|还在听的是这个|点个赞让我回来再听一遍|对她表白|表白成功|谢谢小狗|中转站' },
+            PresetMeme: { enabled: false, rule: '复习到这里|准高一|神人TV|已读乱回|东方是什么动漫|他们为什么打架|不是哥们|发一遍这段文字|躺在这里会比较舒服|这期神了|神在哪|这期拉了|拉在哪|一个赞换一天头像|我想听那一句|我想听那句|一起赤石|VOCAILAND|AI中转站|到底好还是差|绷住挑战|不要做挑战|不要呼吸挑战|绷不住了' },
+            PresetPunch: { enabled: false, rule: '(?:^合影$|^见证历史$|别逗你[^姐].{0,5}姐笑了|你看我这.{0,4}级号|看看你的?.{0,6}剪贴板|我想建个只有.{0,20}的楼|请投.{0,20}一票|传说曲时间\\d{1,9}|一起[赤吃]石|做得好好[！!]?$|做得好差[！!]?$|好在哪[！!?？]?$)' },
             CommentKeywords: [],       // 评论屏蔽词（模糊，子串包含，大小写不敏感）
             CommentRegex: [],          // 评论屏蔽正则（去空白后部分匹配）
             SubstituteWords: [],       // 替换规则 [{find, replace, scopes:['content'|'emoticon']}]
+            RegexReplaceWords: [],     // 正则替换规则 [{find, replace, scopes:['regex']}]（直接匹配原文，空替换=删除）
             EnableReplacement: false,  // 评论内容替换总开关
             ClearCommentEmoticons: false, // 清除评论中全部表情
             ReplaceCommentSearchTerms: false, // 搜索跳转关键词转普通文本
@@ -1406,6 +1478,18 @@ if (typeof module !== 'undefined' && module.exports) {
                 Log(T('LogPurifierBlocked', Hit.matching));
                 return;
             }
+            // 1b. 预设方案命中 → 整条隐藏（去空白后匹配、大小写不敏感；与手动屏蔽正则区分大小写不同）
+            const PresetId = purifierPresetBlockHit(RawText);
+            if (PresetId !== null) {
+                renderer.style.display = 'none';
+                renderer.dataset.bcBlocked = '1';
+                try {
+                    const threadRenderer = renderer.getRootNode().host;
+                    if (threadRenderer) threadRenderer.style.display = 'none';
+                } catch (_) {}
+                Log(T('LogPurifierBlocked', T(PRESET_LABEL_KEYS[PresetId] || PresetId)));
+                return;
+            }
             // 未命中：恢复之前被屏蔽的评论（规则变更重扫场景）
             if (renderer.dataset.bcBlocked) {
                 delete renderer.dataset.bcBlocked;
@@ -1463,6 +1547,20 @@ if (typeof module !== 'undefined' && module.exports) {
                     Span.setAttribute('replace', '');
                     Log(T('LogPurifierReplaced', '内容', OldText, R.content));
                 });
+                // 3d. 正则替换：手动规则（区分大小写）+ 已勾选预设（大小写不敏感）；空替换=删除
+                //      匹配直接作用于原文（不去空白，区别于屏蔽正则）；删除后参与第 4 步字数判定
+                const RegexRules = purifierRegexReplaceRules();
+                if (RegexRules.length > 0) {
+                    contents.querySelectorAll('span').forEach(function(Span) {
+                        if (Span.getAttribute('replace') !== null) return;
+                        const OldText = Span.textContent || '';
+                        const R = CommentRuleEngine.replaceRegex(RegexRules, OldText);
+                        if (!R.state) return;
+                        Span.textContent = R.content;
+                        Span.setAttribute('replace', '');
+                        Log(T('LogPurifierReplaced', '正则', OldText, R.content));
+                    });
+                }
             }
 
             // 4. 计算剩余有效字符（原有行为）
@@ -1489,6 +1587,32 @@ if (typeof module !== 'undefined' && module.exports) {
                 delete R.dataset.bcPurified;
             });
             purifierFindRenderers().forEach(purifierProcessRenderer);
+        }
+
+        /**
+         * 生效的正则替换规则 = 手动规则（区分大小写；预设方案已移出替换通道，见 purifierPresetBlockHit）
+         */
+        function purifierRegexReplaceRules() {
+            const Out = [];
+            (Config.RegexReplaceWords || []).forEach(function(R) {
+                if (R && R.find) Out.push({ find: R.find, replace: R.replace || '' });
+            });
+            return Out;
+        }
+
+        /**
+         * 预设方案命中检测：已勾选预设逐条对原文（去空白）做大小写不敏感正则匹配
+         * 命中即整条评论隐藏（与手动屏蔽词/正则同层，先于内容替换）
+         * 规则内容来自 Config（用户可在面板展开编辑），空规则视为未启用
+         */
+        function purifierPresetBlockHit(text) {
+            for (const Id in REGEX_PRESET_KEYS) {
+                const P = Config[REGEX_PRESET_KEYS[Id]];
+                if (!P || !P.enabled || !P.rule) continue;
+                const R = CommentRuleEngine.regexMatch([P.rule], text, true);
+                if (R.hit !== null) return Id;
+            }
+            return null;
         }
 
         /**
@@ -2332,10 +2456,39 @@ if (typeof module !== 'undefined' && module.exports) {
                     <textarea id="CfgCommentKeywords" rows="3" style="width:100%;background:var(--input-bg);color:var(--text);border:1px solid var(--border-light);border-radius:6px;font-size:13px;font-family:inherit;resize:vertical">${(Config.CommentKeywords || []).join('\n')}</textarea>
                     <label>${T('CommentRegexLabel')}</label>
                     <textarea id="CfgCommentRegex" rows="3" style="width:100%;background:var(--input-bg);color:var(--text);border:1px solid var(--border-light);border-radius:6px;font-size:13px;font-family:inherit;resize:vertical">${(Config.CommentRegex || []).join('\n')}</textarea>
+                    <label>${T('RegexPresetSection')}</label>
+                    <div class="bc-collapse-header" id="CfgPresetHeader_spam">
+                        <span class="bc-collapse-arrow" id="CfgPresetArrow_spam"> > </span>
+                        <label style="flex:1;cursor:pointer"><input type="checkbox" id="CfgRegexPreset_spam" ${(Config.PresetSpam || {}).enabled ? 'checked' : ''}>${T('RegexPresetSpam')}</label>
+                    </div>
+                    <div class="bc-collapse-content collapsed" id="CfgPresetContent_spam">
+                        <textarea id="CfgRegexPresetRule_spam" rows="2" style="width:100%;background:var(--input-bg);color:var(--text);border:1px solid var(--border-light);border-radius:6px;font-size:13px;font-family:inherit;resize:vertical">${(Config.PresetSpam || {}).rule || ''}</textarea>
+                        <div style="display:flex;justify-content:flex-end;margin-top:4px"><button class="bc-btn" id="CfgPresetReset_spam">${T('RegexPresetReset')}</button></div>
+                    </div>
+                    <div class="bc-collapse-header" id="CfgPresetHeader_meme">
+                        <span class="bc-collapse-arrow" id="CfgPresetArrow_meme"> > </span>
+                        <label style="flex:1;cursor:pointer"><input type="checkbox" id="CfgRegexPreset_meme" ${(Config.PresetMeme || {}).enabled ? 'checked' : ''}>${T('RegexPresetMeme')}</label>
+                    </div>
+                    <div class="bc-collapse-content collapsed" id="CfgPresetContent_meme">
+                        <textarea id="CfgRegexPresetRule_meme" rows="3" style="width:100%;background:var(--input-bg);color:var(--text);border:1px solid var(--border-light);border-radius:6px;font-size:13px;font-family:inherit;resize:vertical">${(Config.PresetMeme || {}).rule || ''}</textarea>
+                        <div style="display:flex;justify-content:flex-end;margin-top:4px"><button class="bc-btn" id="CfgPresetReset_meme">${T('RegexPresetReset')}</button></div>
+                    </div>
+                    <div class="bc-collapse-header" id="CfgPresetHeader_punch">
+                        <span class="bc-collapse-arrow" id="CfgPresetArrow_punch"> > </span>
+                        <label style="flex:1;cursor:pointer"><input type="checkbox" id="CfgRegexPreset_punch" ${(Config.PresetPunch || {}).enabled ? 'checked' : ''}>${T('RegexPresetPunch')}</label>
+                    </div>
+                    <div class="bc-collapse-content collapsed" id="CfgPresetContent_punch">
+                        <textarea id="CfgRegexPresetRule_punch" rows="3" style="width:100%;background:var(--input-bg);color:var(--text);border:1px solid var(--border-light);border-radius:6px;font-size:13px;font-family:inherit;resize:vertical">${(Config.PresetPunch || {}).rule || ''}</textarea>
+                        <div style="display:flex;justify-content:flex-end;margin-top:4px"><button class="bc-btn" id="CfgPresetReset_punch">${T('RegexPresetReset')}</button></div>
+                    </div>
+                    <div class="bc-hint">${T('RegexPresetEditHint')}</div>
                     <label>${T('CommentReplaceLabel')}</label>
                     <textarea id="CfgCommentReplace" rows="2" style="width:100%;background:var(--input-bg);color:var(--text);border:1px solid var(--border-light);border-radius:6px;font-size:13px;font-family:inherit;resize:vertical">${purifierRulesToText(Config.SubstituteWords, 'content')}</textarea>
                     <label>${T('EmoticonReplaceLabel')}</label>
                     <textarea id="CfgEmoticonReplace" rows="2" style="width:100%;background:var(--input-bg);color:var(--text);border:1px solid var(--border-light);border-radius:6px;font-size:13px;font-family:inherit;resize:vertical">${purifierRulesToText(Config.SubstituteWords, 'emoticon')}</textarea>
+                    <label>${T('RegexReplaceLabel')}</label>
+                    <textarea id="CfgRegexReplace" rows="2" style="width:100%;background:var(--input-bg);color:var(--text);border:1px solid var(--border-light);border-radius:6px;font-size:13px;font-family:inherit;resize:vertical">${purifierRulesToText(Config.RegexReplaceWords, 'regex')}</textarea>
+                    <div class="bc-hint">${T('RegexReplaceHint')}</div>
                     <label>${T('EnableReplacement')} <input type="checkbox" id="CfgEnableReplacement" ${Config.EnableReplacement ? 'checked' : ''}></label>
                     <label>${T('ClearEmoticons')} <input type="checkbox" id="CfgClearEmoticons" ${Config.ClearCommentEmoticons ? 'checked' : ''}></label>
                     <label>${T('ReplaceSearchTerms')} <input type="checkbox" id="CfgReplaceSearchTerms" ${Config.ReplaceCommentSearchTerms ? 'checked' : ''}></label>
@@ -2394,13 +2547,18 @@ if (typeof module !== 'undefined' && module.exports) {
                     CommentKeywords: document.getElementById('CfgCommentKeywords').value.split('\n').map(S => S.trim()).filter(Boolean),
                     CommentRegex: document.getElementById('CfgCommentRegex').value.split('\n').map(S => S.trim()).filter(Boolean),
                     SubstituteWords: purifierTextToRules(document.getElementById('CfgCommentReplace').value, 'content')
-                        .concat(purifierTextToRules(document.getElementById('CfgEmoticonReplace').value, 'emoticon'))
+                        .concat(purifierTextToRules(document.getElementById('CfgEmoticonReplace').value, 'emoticon')),
+                    RegexReplaceWords: purifierTextToRules(document.getElementById('CfgRegexReplace').value, 'regex'),
+                    PresetSpam: { enabled: document.getElementById('CfgRegexPreset_spam').checked, rule: document.getElementById('CfgRegexPresetRule_spam').value.trim() },
+                    PresetMeme: { enabled: document.getElementById('CfgRegexPreset_meme').checked, rule: document.getElementById('CfgRegexPresetRule_meme').value.trim() },
+                    PresetPunch: { enabled: document.getElementById('CfgRegexPreset_punch').checked, rule: document.getElementById('CfgRegexPresetRule_punch').value.trim() }
                 };
                 Object.assign(Config, NewConfig);
                 SaveConfig(Config);
 
                 // 评论规则变更 → 重扫全部评论（恢复不再命中的、隐藏新命中的、应用新替换）
                 const CommentKeys = ['CommentKeywords', 'CommentRegex', 'SubstituteWords',
+                    'RegexReplaceWords', 'PresetSpam', 'PresetMeme', 'PresetPunch',
                     'EnableReplacement', 'ClearCommentEmoticons', 'ReplaceCommentSearchTerms'];
                 const RulesChanged = CommentKeys.some(function(K) {
                     return JSON.stringify(OldConfig[K]) !== JSON.stringify(Config[K]);
@@ -2449,6 +2607,13 @@ if (typeof module !== 'undefined' && module.exports) {
                 document.getElementById('CfgCommentRegex').value = '';
                 document.getElementById('CfgCommentReplace').value = '';
                 document.getElementById('CfgEmoticonReplace').value = '';
+                document.getElementById('CfgRegexReplace').value = '';
+                document.getElementById('CfgRegexPreset_spam').checked = false;
+                document.getElementById('CfgRegexPreset_meme').checked = false;
+                document.getElementById('CfgRegexPreset_punch').checked = false;
+                document.getElementById('CfgRegexPresetRule_spam').value = DEFAULTS.PresetSpam.rule;
+                document.getElementById('CfgRegexPresetRule_meme').value = DEFAULTS.PresetMeme.rule;
+                document.getElementById('CfgRegexPresetRule_punch').value = DEFAULTS.PresetPunch.rule;
                 document.getElementById('CfgColorMode').value = Config.ColorMode || 'auto';
                 document.getElementById('CfgKeepUids').value = '';
                 for (var I = 0; I < ELEMENT_REMOVAL_PRESETS.length; I++) {
@@ -2495,6 +2660,26 @@ if (typeof module !== 'undefined' && module.exports) {
                     content.classList.add('collapsed');
                     arrow.classList.remove('open');
                 }
+            });
+
+            // 预设方案：折叠切换（点击勾选框/标签不触发折叠）+ 恢复默认
+            ['spam', 'meme', 'punch'].forEach(function(Id) {
+                document.getElementById('CfgPresetHeader_' + Id).addEventListener('click', function(E) {
+                    if (E.target.closest('label, input')) return; // 勾选操作不展开/收起
+                    const content = document.getElementById('CfgPresetContent_' + Id);
+                    const arrow = document.getElementById('CfgPresetArrow_' + Id);
+                    const isCollapsed = content.classList.contains('collapsed');
+                    if (isCollapsed) {
+                        content.classList.remove('collapsed');
+                        arrow.classList.add('open');
+                    } else {
+                        content.classList.add('collapsed');
+                        arrow.classList.remove('open');
+                    }
+                });
+                document.getElementById('CfgPresetReset_' + Id).addEventListener('click', function() {
+                    document.getElementById('CfgRegexPresetRule_' + Id).value = DEFAULTS[REGEX_PRESET_KEYS[Id]].rule;
+                });
             });
 
             // 去除元素折叠切换
