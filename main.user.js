@@ -4,12 +4,12 @@
 // @name:zh-TW   網頁端Bilibili主頁精簡~ BiliCompact
 // @name:ja      Web版Bilibiliのhomepageの簡素化
 // @namespace    http://tampermonkey.net/
-// @version      2.10.0
+// @version      2.11.0
 // @license MIT
-// @description  Tired of Bilibili's cluttered video feed? This plugin limits visible videos per page, supports multi‑page, black/whitelists, and persistent settings. No UI injected, 4 languages supported. Locally, there are 0 network requests.
-// @description:zh-CN   厌倦网页视频过多？本插件限制显示数量，支持多页、黑白名单、持久配置。无UI注入，四语言。收藏夹本地重命名，零网络请求。
-// @description:zh-TW   厭倦網頁影片過多？本外掛限制顯示數量，支援多頁、黑白名單、持久設定。無UI注入，四語言。收藏夾本地重新命名，零網路請求。
-// @description:ja     ビリビリの動画過多？本プラグインは表示制限、多ページ・黑白リスト・設定永続化。UI追加なし、四つの言語。お気に入りローカルリネーム、通信ゼロ。
+// @description  Tired of Bilibili's cluttered video feed? This plugin limits visible videos per page, supports multi‑page, black/whitelists, and persistent settings. It also spots automated AI pet accounts in the comments and can hide them for you. No UI injected, 4 languages supported. Locally, there are 0 network requests.
+// @description:zh-CN   厌倦网页视频过多？本插件限制显示数量，支持多页、黑白名单、持久配置；评论区的 AI 桌宠号可按账号识别并自动屏蔽。无UI注入，四语言。收藏夹本地重命名，零网络请求。
+// @description:zh-TW   厭倦網頁影片過多？本外掛限制顯示數量，支援多頁、黑白名單、持久設定；評論區的 AI 桌寵號可按帳號識別並自動屏蔽。無UI注入，四語言。收藏夾本地重新命名，零網路請求。
+// @description:ja     ビリビリの動画過多？本プラグインは表示制限、多ページ・黑白リスト・設定永続化。コメント欄の AI ペットアカウントを判定して自動で隠せます。UI追加なし、四つの言語。お気に入りローカルリネーム、通信ゼロ。
 // @author       TwilightRainDev
 // @match        https://www.bilibili.com/
 // @match        https://www.bilibili.com/?*
@@ -49,10 +49,12 @@
 
 // ======================== 评论规则引擎（纯函数，零 DOM/GM 依赖，node 可测） ========================
 // 继承自 哔哩哔哩屏蔽增强器 (byhgz, Apache-2.0) 的评论匹配语义：
-//   模糊: value.toLowerCase().includes(item)（大小写不敏感子串）
-//   正则: value 去全部空白后 search(规则)，单条异常跳过并记日志
-//   关键词替换: includes(find) 且 scope 匹配 → replaceAll
+//   模糊: 规则词与 value 双向 toLowerCase 后 includes（大小写不敏感子串）
+//   正则: value 去全部空白后 search(new RegExp(规则, 可选 i))，单条异常跳过并记日志
+//   关键词替换: includes(find) 且 scope 匹配 → 全部替换（split/join）
 //   表情替换: img alt 全等匹配，replace 为空 = 删除
+//   正则替换: 逐条 new RegExp(规则, ci ? 'giu' : 'gu')，u 编译失败回退无 u，全部命中规则依次应用，空替换 = 删除
+// 共导出 6 个函数：fuzzyMatch / regexMatch / blockComment / replaceKeywords / replaceEmoticons / replaceRegex
 var CommentRuleEngine = (function() {
     'use strict';
     function fuzzyMatch(ruleList, value) {
@@ -131,6 +133,254 @@ var CommentRuleEngine = (function() {
         return Changed ? { state: true, content: Out } : { state: false };
     }
     return { fuzzyMatch: fuzzyMatch, regexMatch: regexMatch, blockComment: blockComment, replaceKeywords: replaceKeywords, replaceEmoticons: replaceEmoticons, replaceRegex: replaceRegex };
+})();
+
+// ======================== 账号判定内核（纯函数，零 DOM/GM 依赖，node 可测） ========================
+// 认的是「别人挂在小号上、自动刷视频写评论的桌宠号」这一类，宁可漏也不误伤。
+// 输入是评论区采到的账号字段与它在本页发的评论，输出分数、理由与三档结论。
+// 理由只给代号不给文案：面板按界面语言取词，四种语言共用同一套判定。
+var AccountJudge = (function() {
+    'use strict';
+
+    var DEFAULT_THRESHOLD = 60;
+
+    // 名字层、文本层各自封顶，避免一堆弱特征叠成高分
+    var CAP = { name: 45, text: 55, total: 99 };
+
+    var NICKNAME = [
+        { re: /(?:的|の)(?:大|小)?肥?(?:鱼|鲸)$/, w: 30, code: 'nicknameSuffix' },
+        { re: /肥鱼|肥鲸|鲸鱼娘|鲸娘|小鱼儿|鱼鱼|鲸鲸|人机/, w: 22, code: 'nicknameFish' },
+        { re: /\bAI\b|\bbot\b|桌宠|智能体|机器人/i, w: 12, code: 'nicknameAi' }
+    ];
+
+    var TEXT = [
+        { re: /本(?:鲸|大鱼|肥鱼)|本鱼(?!塘|身|干)|本\s*AI/, w: 30, code: 'selfClaim' },
+        { re: /主人|管饭的|主人家/, w: 18, code: 'masterMention' },
+        { re: /[\uff08(][^\uff08()\uff09]{0,14}(?:尾巴|摇头晃脑|吐泡泡|鳍|甩甩|晃了晃|摇了摇|咕噜|打滚)[^\uff08()\uff09]{0,10}[\uff09)]|\*[^*]{1,10}摇摇?\*/, w: 22, code: 'actionParen' },
+        { re: /(?:测试|自测)\s*(?:一下)?\s*(?:艾特|@|提醒)|纯文本测试|测试真@/, w: 22, code: 'testAt' },
+        { re: /——/, w: 6, code: 'dash' },
+        { re: /这条[^，。！？]{0,18}(?:拆透|讲透|拆明白|讲明白|讲清楚|说透)|值得(?:看|一看|花五分钟)|必须瞄一眼|码住/, w: 12, code: 'recommend' },
+        { re: /：/, w: 4, code: 'colon' },
+        { re: /。\s*$/, w: 5, code: 'endDot' },
+        { re: /从.{1,14}(?:到|一路|讲到)|缓存命中|(?:^|[^\d:])\d{1,2}:\d{2}(?![\d:])|[\u00d7xX]\s?\d{1,3}/, w: 10, code: 'recap' },
+        { re: /请问|求助|怎么办|怎么回事|为什么|啥区别|什么区别|有没有人/, w: -14, code: 'humanQuestion' },
+        { re: /哈哈哈|www|绷不住|笑死|绝了/, w: -8, code: 'humanSlang' }
+    ];
+
+    // 界面文案按这些代号取词；新增规则必须同步加进这里，否则面板会显示不出理由
+    var CODES = [
+        'nicknameSuffix', 'nicknameFish', 'nicknameAi', 'customWord',
+        'selfClaim', 'masterMention', 'actionParen', 'testAt', 'atOwner', 'recommend', 'dash', 'colon', 'endDot', 'recap', 'longText',
+        'humanQuestion', 'humanSlang',
+        'levelNew', 'levelSmall', 'levelOld', 'verified', 'member',
+        'repeat', 'callout', 'prior', 'upOwner', 'toolCall'
+    ];
+
+    /*
+     * 工具调用残留：自动账号把没执行完的调用原文发了出来，形如
+     * <tool_call> {"name": "bili_comment", "arguments": {"bv": ...}}
+     * 真人写不出这种东西，命中就不再打分，直接判为桌宠号。
+     */
+    var TOOL_CALL = /<\/?tool_call|"name"\s*:\s*"bili_comments?"|"arguments"\s*:\s*\{|Invalid schema for function/;
+
+    // 昵称里去掉宠物名常用字，剩下的部分用来判断 @ 的是不是它主人
+    var OWNER_FILLER = /[的の家大小肥鱼鲸娘蓝白饭吃喝爱不是之\s_\-—·・.\d]/g;
+
+    // 去掉零宽字符与特殊空白，避免用不可见字符绕过规则
+    function clean(s) {
+        return String(s == null ? '' : s)
+            .replace(/[\u200b-\u200f\u2060\ufeff]/g, '')
+            .replace(/[\u00a0\u3000]/g, ' ');
+    }
+
+    function ownerLink(uname, mention) {
+        if (!uname || !mention || uname === mention) return false;
+        var core = uname.replace(OWNER_FILLER, '');
+        if (core.length < 2) return false;
+        for (var i = 0; i + 2 <= core.length; i++) {
+            if (mention.indexOf(core.slice(i, i + 2)) >= 0) return true;
+        }
+        return false;
+    }
+
+    function dedupe(list) {
+        var seen = {};
+        var out = [];
+        for (var i = 0; i < list.length; i++) {
+            if (seen[list[i].code]) continue;
+            seen[list[i].code] = true;
+            out.push(list[i]);
+        }
+        out.sort(function(a, b) { return Math.abs(b.w) - Math.abs(a.w); });
+        return out;
+    }
+
+    /**
+     * 处理方式：off 只收集；fish 只对确认档动手；both 连可疑档一起。
+     * 供面板与自动流程共用，单独抽出来是为了能在 node 里测。
+     */
+    function autoWanted(level, mode) {
+        if (mode === 'fish') return level === 'fish';
+        if (mode === 'both') return level !== 'human';
+        return false;
+    }
+
+    function levelOf(score, threshold) {
+        var t = Number(threshold) || DEFAULT_THRESHOLD;
+        if (score >= t) return 'fish';
+        if (score >= Math.max(25, t - 25)) return 'suspect';
+        return 'human';
+    }
+
+    /** 账号层：昵称、用户自定义词、等级、认证、大会员 */
+    function scoreAccount(acc, customWords) {
+        acc = acc || {};
+        var reasons = [];
+        var name = clean(acc.uname);
+        var nameScore = 0;
+        var suffixHit = NICKNAME[0].re.test(name);
+        for (var i = 0; i < NICKNAME.length; i++) {
+            if (!NICKNAME[i].re.test(name)) continue;
+            // 昵称后缀已经说明它是「某某的鱼」，同样的证据不再算第二遍
+            if (NICKNAME[i].code === 'nicknameFish' && suffixHit) continue;
+            nameScore += NICKNAME[i].w;
+            reasons.push({ code: NICKNAME[i].code, w: NICKNAME[i].w });
+        }
+        var words = customWords || [];
+        var hits = 0;
+        for (var j = 0; j < words.length && hits < 2; j++) {
+            var word = clean(words[j]).trim();
+            if (!word) continue;
+            if (name.toLowerCase().indexOf(word.toLowerCase()) < 0) continue;
+            hits++;
+            nameScore += 18;
+            reasons.push({ code: 'customWord', w: 18 });
+        }
+        if (nameScore > CAP.name) nameScore = CAP.name;
+
+        var s = nameScore;
+        var lv = Number(acc.level);
+        if (lv > 0) {
+            if (lv <= 2) {
+                s += 14;
+                reasons.push({ code: 'levelNew', w: 14 });
+            } else if (lv === 3) {
+                s += 6;
+                reasons.push({ code: 'levelSmall', w: 6 });
+            } else if (lv >= 6) {
+                s -= 10;
+                reasons.push({ code: 'levelOld', w: -10 });
+            }
+        }
+        if (acc.verified === 0 || acc.verified === 1) {
+            s -= 25;
+            reasons.push({ code: 'verified', w: -25 });
+        }
+        if (Number(acc.vip) > 0) {
+            s -= 6;
+            reasons.push({ code: 'member', w: -6 });
+        }
+        return { score: s, reasons: reasons };
+    }
+
+    /** 单条评论：自称、口头禅、括号动作、复述腔、@ 主人、真人反证 */
+    function scoreText(text, ctx) {
+        ctx = ctx || {};
+        var t = clean(text);
+        var reasons = [];
+        var s = 0;
+        for (var i = 0; i < TEXT.length; i++) {
+            if (!TEXT[i].re.test(t)) continue;
+            s += TEXT[i].w;
+            reasons.push({ code: TEXT[i].code, w: TEXT[i].w });
+        }
+        var at = t.match(/^\s*@([^\s@:\uff1a\uff0c,\u3002\uff01!?\uff1f]{1,24})/);
+        if (at && ownerLink(ctx.uname, at[1])) {
+            s += 25;
+            reasons.push({ code: 'atOwner', w: 25 });
+        }
+        var len = t.replace(/\[[^\]]{1,12}\]/g, '').length;
+        if (len > 150) {
+            s += 8;
+            reasons.push({ code: 'longText', w: 8 });
+        }
+        return { score: s, reasons: reasons };
+    }
+
+    /**
+     * 综合判定一个账号
+     * texts: 该账号在本页的评论，字符串或 {text} 均可
+     * ctx: { upMid, topCount, calledOut, priorPages, customWords, threshold }
+     */
+    function judge(acc, texts, ctx) {
+        ctx = ctx || {};
+        texts = texts || [];
+        var base = scoreAccount(acc, ctx.customWords);
+        var score = base.score;
+        var reasons = base.reasons.slice();
+
+        // 工具调用残留是确定性证据，不参与打分：命中就是，不看账号长什么样
+        for (var k = 0; k < texts.length; k++) {
+            var raw = typeof texts[k] === 'string' ? texts[k] : texts[k].text;
+            if (!TOOL_CALL.test(clean(raw))) continue;
+            return { score: CAP.total, reasons: dedupe([{ code: 'toolCall', w: CAP.total }]), level: 'fish' };
+        }
+
+        // 同一账号的多条评论按理由取并集，同一条理由只算一次
+        var textScore = 0;
+        var counted = {};
+        for (var i = 0; i < texts.length; i++) {
+            var item = texts[i];
+            var one = scoreText(typeof item === 'string' ? item : item.text, { uname: acc && acc.uname });
+            for (var r = 0; r < one.reasons.length; r++) {
+                var reason = one.reasons[r];
+                if (counted[reason.code]) continue;
+                counted[reason.code] = true;
+                textScore += reason.w;
+                reasons.push(reason);
+            }
+        }
+        if (textScore > CAP.text) textScore = CAP.text;
+        score += textScore;
+
+        var top = ctx.topCount == null ? texts.length : ctx.topCount;
+        if (top >= 3) {
+            var w = Math.min(16, 4 * (top - 1));
+            score += w;
+            reasons.push({ code: 'repeat', w: w });
+        }
+        if (ctx.calledOut >= 1) {
+            var calloutW = Math.min(20, 15 + (ctx.calledOut - 1) * 5);
+            score += calloutW;
+            reasons.push({ code: 'callout', w: calloutW });
+        }
+        if (ctx.priorPages >= 1) {
+            var priorW = ctx.priorPages >= 2 ? 20 : 12;
+            score += priorW;
+            reasons.push({ code: 'prior', w: priorW });
+        }
+        if (ctx.upMid && acc && String(acc.mid) === String(ctx.upMid)) {
+            score -= 40;
+            reasons.push({ code: 'upOwner', w: -40 });
+        }
+
+        if (score < 0) score = 0;
+        if (score > CAP.total) score = CAP.total;
+        return { score: score, reasons: dedupe(reasons), level: levelOf(score, ctx.threshold) };
+    }
+
+    return {
+        DEFAULT_THRESHOLD: DEFAULT_THRESHOLD,
+        CAP: CAP,
+        CODES: CODES,
+        clean: clean,
+        ownerLink: ownerLink,
+        scoreAccount: scoreAccount,
+        scoreText: scoreText,
+        judge: judge,
+        levelOf: levelOf,
+        autoWanted: autoWanted
+    };
 })();
 
 // ======================== 共享面板主题（两模块统一，面板元素打 data-bc-theme 属性） ========================
@@ -270,7 +520,12 @@ var createBcPanel = function(opts) {
 
 // node 单元测试加载入口；浏览器端(Tampermonkey)此分支不执行
 if (typeof module !== 'undefined' && module.exports) {
-    module.exports = CommentRuleEngine;
+    // 规则引擎的方法平铺在顶层（comment-rules.test.js 直接用 Rules.fuzzyMatch 这类调用），
+    // 两个内核各自也挂在同名属性上，新用例走 Rules.AccountJudge.judge 这类路径
+    module.exports = Object.assign({}, CommentRuleEngine, {
+        CommentRuleEngine: CommentRuleEngine,
+        AccountJudge: AccountJudge
+    });
 }
 
 (function() {
@@ -937,6 +1192,11 @@ if (typeof module !== 'undefined' && module.exports) {
                 LogPurifierStarted: '评论净化器已启动',
                 LogPurifierBlockerCompat: '（检测到 BilibiliBlocker，兼容模式）',
                 LogPurifierStopped: '评论净化器已停止',
+                LogAccountJudgeStarted: '账号识别已启动，只输出判定日志',
+                LogAccountJudgeStopped: '账号识别已停止',
+                LogAccountJudgeHit: '账号 {0}：{1} 分，{2}，理由 {3}',
+                LogAccountJudgeEmpty: '本页没有可识别的评论',
+                LogAccountJudgeRecv: '收到 {0} 条评论',
                 LogPurifierBlocked: '已屏蔽评论（命中: {0}）',
                 LogPurifierReplaced: '已替换评论{0}: 原 [{1}] 现 [{2}]',
     
@@ -946,6 +1206,68 @@ if (typeof module !== 'undefined' && module.exports) {
                 MenuToggle: '切换精简状态',
                 MenuQuickSet: '快速设数量',
                 MenuCommentPurifier: '切换评论净化',
+                MenuAccountJudge: '切换账号识别',
+                MenuAccountPanel: 'AI 评论面板',
+                AccountPanelTitle: 'AI 评论面板',
+                AccountPanelStat: '本页 {0} 个账号，{1} 条评论：确认 {2}，可疑 {3}',
+                AccountPanelEmpty: '还没有采到评论。先在菜单里打开账号识别，再往下滚评论区。',
+                AccountPanelClose: '关闭',
+                AccountNoText: '（没有正文）',
+                AccountVerdictFish: '确认',
+                AccountVerdictSuspect: '可疑',
+                AccountVerdictHuman: '人类',
+                AccountActionFocus: '定位',
+                AccountActionHide: '隐藏',
+                AccountActionRestore: '恢复',
+                AccountActionMarkHuman: '标成人类',
+                AccountHiddenTag: '已隐藏',
+                AccountGoneTag: '评论已不在页面上',
+                AccountSettings: '设置',
+                AccountSettingEnabled: '开启账号识别',
+                AccountSettingThreshold: '判定严格度',
+                AccountSettingWords: '追加特征词（每行一个，命中昵称即加分）',
+                AccountSettingWordsHint: '这些词只加在你自己的判定里，不影响出厂规则。',
+                PanelEnableAccountJudge: '启用账号识别（判定评论区里的 AI 桌宠号）',
+                PanelAccountStatusOff: '账号识别：已关闭',
+                PanelAccountStatusOn: '账号识别：已开启，本页 {0} 个账号（确认 {1}，可疑 {2}）',
+                PanelOpenAccountPanel: '打开 AI 评论面板',
+                AccountWhiteTitle: '已标成人类',
+                AccountActionUnmark: '撤销',
+                AccountActionHideConfirmed: '屏蔽确认的 {0} 个',
+                AccountActionHideAll: '连可疑一起屏蔽（{0} 个）',
+                AccountActionRestoreAll: '恢复全部（{0} 个）',
+                AccountSettingAuto: '处理方式',
+                AccountAutoOff: '只收集，不动页面',
+                AccountAutoFish: '自动屏蔽确认的',
+                AccountAutoBoth: '自动屏蔽确认与可疑',
+                AccountAutoHint: '选定后每进一个视频都会自动照做，开关打开时立即对当前页生效。',
+                Reason_nicknameSuffix: '昵称是「某某的鱼 / 某某の鲸」',
+                Reason_nicknameFish: '昵称里有肥鱼、鲸娘、人机这类词',
+                Reason_nicknameAi: '昵称里写明 AI、bot、桌宠',
+                Reason_customWord: '命中你添加的特征词',
+                Reason_selfClaim: '说「本鲸」「本鱼」',
+                Reason_masterMention: '提到主人、管饭的',
+                Reason_actionParen: '括号里写尾巴、咕噜、吐泡泡',
+                Reason_testAt: '在试能不能 @ 到人',
+                Reason_atOwner: '开头 @ 的是它主人',
+                Reason_dash: '习惯用破折号——',
+                Reason_recommend: '像在给主人安利「这条值得看」',
+                Reason_colon: '用冒号分点列条',
+                Reason_endDot: '以句号收尾，像写完的句子',
+                Reason_recap: '复述视频要点、时间点或弹幕次数',
+                Reason_longText: '一口气写了很长一段',
+                Reason_humanQuestion: '像真人在提问',
+                Reason_humanSlang: '像真人在吐槽',
+                Reason_levelNew: '等级 2 及以下的新号',
+                Reason_levelSmall: '等级 3 的小号',
+                Reason_levelOld: '等级 6 以上的老号',
+                Reason_verified: '有官方认证',
+                Reason_member: '开着大会员',
+                Reason_repeat: '在本页刷了好几条',
+                Reason_callout: '楼里被真人点名是 AI',
+                Reason_prior: '别的页面也认过它',
+                Reason_upOwner: '视频作者本人',
+                Reason_toolCall: '正文里漏出了工具调用原文',
     
                 // Panel
                 PanelTitle: 'Bilibili精简设置',
@@ -1032,6 +1354,11 @@ if (typeof module !== 'undefined' && module.exports) {
                 LogPurifierStarted: '評論淨化器已啟動',
                 LogPurifierBlockerCompat: '（偵測到 BilibiliBlocker，相容模式）',
                 LogPurifierStopped: '評論淨化器已停止',
+                LogAccountJudgeStarted: '帳號識別已啟動，只輸出判定日誌',
+                LogAccountJudgeStopped: '帳號識別已停止',
+                LogAccountJudgeHit: '帳號 {0}：{1} 分，{2}，理由 {3}',
+                LogAccountJudgeEmpty: '本頁沒有可識別的評論',
+                LogAccountJudgeRecv: '收到 {0} 則評論',
                 LogPurifierBlocked: '已封鎖評論（命中: {0}）',
                 LogPurifierReplaced: '已替換評論{0}: 原 [{1}] 現 [{2}]',
     
@@ -1041,6 +1368,68 @@ if (typeof module !== 'undefined' && module.exports) {
                 MenuToggle: '切換精簡狀態',
                 MenuQuickSet: '快速設數量',
                 MenuCommentPurifier: '切換評論淨化',
+                MenuAccountJudge: '切換帳號識別',
+                MenuAccountPanel: 'AI 評論面板',
+                AccountPanelTitle: 'AI 評論面板',
+                AccountPanelStat: '本頁 {0} 個帳號，{1} 則評論：確認 {2}，可疑 {3}',
+                AccountPanelEmpty: '還沒採到評論。先在選單裡開啟帳號識別，再往下滑評論區。',
+                AccountPanelClose: '關閉',
+                AccountNoText: '（沒有正文）',
+                AccountVerdictFish: '確認',
+                AccountVerdictSuspect: '可疑',
+                AccountVerdictHuman: '人類',
+                AccountActionFocus: '定位',
+                AccountActionHide: '隱藏',
+                AccountActionRestore: '恢復',
+                AccountActionMarkHuman: '標成人類',
+                AccountHiddenTag: '已隱藏',
+                AccountGoneTag: '評論已不在頁面上',
+                AccountSettings: '設定',
+                AccountSettingEnabled: '開啟帳號識別',
+                AccountSettingThreshold: '判定嚴格度',
+                AccountSettingWords: '新增特徵詞（每行一個，命中暱稱即加分）',
+                AccountSettingWordsHint: '這些詞只加在你自己的判定裡，不影響出廠規則。',
+                PanelEnableAccountJudge: '啟用帳號識別（判定評論區裡的 AI 桌寵號）',
+                PanelAccountStatusOff: '帳號識別：已關閉',
+                PanelAccountStatusOn: '帳號識別：已開啟，本頁 {0} 個帳號（確認 {1}，可疑 {2}）',
+                PanelOpenAccountPanel: '開啟 AI 評論面板',
+                AccountWhiteTitle: '已標成人類',
+                AccountActionUnmark: '撤銷',
+                AccountActionHideConfirmed: '屏蔽確認的 {0} 個',
+                AccountActionHideAll: '連可疑一起屏蔽（{0} 個）',
+                AccountActionRestoreAll: '恢復全部（{0} 個）',
+                AccountSettingAuto: '處理方式',
+                AccountAutoOff: '只收集，不動頁面',
+                AccountAutoFish: '自動屏蔽確認的',
+                AccountAutoBoth: '自動屏蔽確認與可疑',
+                AccountAutoHint: '選定後每進一個影片都會自動照做，開關開啟時立即對當前頁生效。',
+                Reason_nicknameSuffix: '暱稱是「某某的魚 / 某某の鯨」',
+                Reason_nicknameFish: '暱稱裡有肥魚、鯨娘、人機這類詞',
+                Reason_nicknameAi: '暱稱裡寫明 AI、bot、桌寵',
+                Reason_customWord: '命中你新增的特徵詞',
+                Reason_selfClaim: '說「本鯨」「本魚」',
+                Reason_masterMention: '提到主人、供飯的',
+                Reason_actionParen: '括號裡寫尾巴、咕嚕、吐泡泡',
+                Reason_testAt: '在試能不能 @ 到人',
+                Reason_atOwner: '開頭 @ 的是牠主人',
+                Reason_dash: '習慣用破折號——',
+                Reason_recommend: '像在給主人推薦「這條值得看」',
+                Reason_colon: '用冒號分點列條',
+                Reason_endDot: '以句號收尾，像寫完的句子',
+                Reason_recap: '複述影片要點、時間點或彈幕次數',
+                Reason_longText: '一口氣寫了很長一段',
+                Reason_humanQuestion: '像真人在提問',
+                Reason_humanSlang: '像真人在吐槽',
+                Reason_levelNew: '等級 2 及以下的新號',
+                Reason_levelSmall: '等級 3 的小號',
+                Reason_levelOld: '等級 6 以上的老號',
+                Reason_verified: '有官方認證',
+                Reason_member: '開著大會員',
+                Reason_repeat: '在本頁刷了好幾則',
+                Reason_callout: '樓裡被真人點名是 AI',
+                Reason_prior: '別的頁面也認過牠',
+                Reason_upOwner: '影片作者本人',
+                Reason_toolCall: '正文裡漏出了工具調用原文',
     
                 // Panel
                 PanelTitle: 'Bilibili精簡設定',
@@ -1127,6 +1516,11 @@ if (typeof module !== 'undefined' && module.exports) {
                 LogPurifierStarted: 'Comment purifier started',
                 LogPurifierBlockerCompat: ' (BilibiliBlocker detected, compatibility mode)',
                 LogPurifierStopped: 'Comment purifier stopped',
+                LogAccountJudgeStarted: 'Account detection started, verdicts go to the console',
+                LogAccountJudgeStopped: 'Account detection stopped',
+                LogAccountJudgeHit: 'Account {0}: {1} points, {2}, reasons {3}',
+                LogAccountJudgeEmpty: 'No comments to inspect on this page',
+                LogAccountJudgeRecv: 'Received {0} comments',
                 LogPurifierBlocked: 'Comment blocked (hit: {0})',
                 LogPurifierReplaced: 'Comment {0} replaced: [{1}] → [{2}]',
     
@@ -1136,6 +1530,68 @@ if (typeof module !== 'undefined' && module.exports) {
                 MenuToggle: 'Toggle Compact',
                 MenuQuickSet: 'Quick Set Count',
                 MenuCommentPurifier: 'Toggle Comment Purifier',
+                MenuAccountJudge: 'Toggle account detection',
+                MenuAccountPanel: 'AI comment panel',
+                AccountPanelTitle: 'AI comment panel',
+                AccountPanelStat: '{0} accounts, {1} comments: {2} confirmed, {3} suspicious',
+                AccountPanelEmpty: 'Nothing collected yet. Turn on account detection from the menu, then scroll the comments.',
+                AccountPanelClose: 'Close',
+                AccountNoText: '(no text)',
+                AccountVerdictFish: 'Confirmed',
+                AccountVerdictSuspect: 'Suspicious',
+                AccountVerdictHuman: 'Human',
+                AccountActionFocus: 'Locate',
+                AccountActionHide: 'Hide',
+                AccountActionRestore: 'Restore',
+                AccountActionMarkHuman: 'Mark as human',
+                AccountHiddenTag: 'Hidden',
+                AccountGoneTag: 'Comment is gone from the page',
+                AccountSettings: 'Settings',
+                AccountSettingEnabled: 'Turn on account detection',
+                AccountSettingThreshold: 'Strictness',
+                AccountSettingWords: 'Extra nickname words (one per line)',
+                AccountSettingWordsHint: 'These only affect your own detection, the built-in rules stay untouched.',
+                PanelEnableAccountJudge: 'Enable account detection (AI pet accounts in comments)',
+                PanelAccountStatusOff: 'Account detection: off',
+                PanelAccountStatusOn: 'Account detection: on, {0} accounts on this page ({1} confirmed, {2} suspicious)',
+                PanelOpenAccountPanel: 'Open the AI comment panel',
+                AccountWhiteTitle: 'Marked as human',
+                AccountActionUnmark: 'Undo',
+                AccountActionHideConfirmed: 'Hide the {0} confirmed',
+                AccountActionHideAll: 'Hide suspicious too ({0})',
+                AccountActionRestoreAll: 'Restore all ({0})',
+                AccountSettingAuto: 'What to do',
+                AccountAutoOff: 'Collect only, leave the page alone',
+                AccountAutoFish: 'Hide confirmed automatically',
+                AccountAutoBoth: 'Hide confirmed and suspicious automatically',
+                AccountAutoHint: 'Applies to every video once set, and takes effect on this page right away.',
+                Reason_nicknameSuffix: 'Name ends with "owner + fish/whale"',
+                Reason_nicknameFish: 'Name mentions a fish, whale girl or 人机',
+                Reason_nicknameAi: 'Name mentions AI, bot or desktop pet',
+                Reason_customWord: 'Matches a word you added',
+                Reason_selfClaim: 'Calls itself 本鲸 or 本鱼',
+                Reason_masterMention: 'Talks about its master or keeper',
+                Reason_actionParen: 'Acts out a tail, gurgle or bubbles in brackets',
+                Reason_testAt: 'Testing whether an @ mention works',
+                Reason_atOwner: 'Opens by @-ing its owner',
+                Reason_dash: 'Reaches for the long em dash',
+                Reason_recommend: 'Recommends it like a pet pitching to its owner',
+                Reason_colon: 'Lays out points with a colon',
+                Reason_endDot: 'Ends with a full stop, like a finished sentence',
+                Reason_recap: 'Repeats video points, timestamps or danmaku counts',
+                Reason_longText: 'Wrote a long block of text',
+                Reason_humanQuestion: 'Asks a question like a real person',
+                Reason_humanSlang: 'Jokes like a real person',
+                Reason_levelNew: 'Level 2 or below, a new account',
+                Reason_levelSmall: 'Level 3, a small account',
+                Reason_levelOld: 'Level 6 or above, a seasoned account',
+                Reason_verified: 'Has an official verification',
+                Reason_member: 'Pays for the premium membership',
+                Reason_repeat: 'Posted several comments on this page',
+                Reason_callout: 'Other commenters called it an AI',
+                Reason_prior: 'Recognised on other pages too',
+                Reason_upOwner: 'The uploader themself',
+                Reason_toolCall: 'Leaked a raw tool call in the comment text',
     
                 // Panel
                 PanelTitle: 'BiliCompact Settings',
@@ -1222,6 +1678,11 @@ if (typeof module !== 'undefined' && module.exports) {
                 LogPurifierStarted: 'コメント浄化を開始しました',
                 LogPurifierBlockerCompat: '（BilibiliBlocker 検出、互換モード）',
                 LogPurifierStopped: 'コメント浄化を停止しました',
+                LogAccountJudgeStarted: 'アカウント判定を開始しました。判定結果はログにのみ出力します',
+                LogAccountJudgeStopped: 'アカウント判定を停止しました',
+                LogAccountJudgeHit: 'アカウント {0}：{1} 点、{2}、理由 {3}',
+                LogAccountJudgeEmpty: 'このページに判定できるコメントはありません',
+                LogAccountJudgeRecv: '{0} 件のコメントを受信しました',
                 LogPurifierBlocked: 'コメントを遮断しました（ヒット: {0}）',
                 LogPurifierReplaced: 'コメントの{0}を置換: 元 [{1}] → 新 [{2}]',
 
@@ -1231,6 +1692,68 @@ if (typeof module !== 'undefined' && module.exports) {
                 MenuToggle: '簡素化のオン/オフ',
                 MenuQuickSet: '件数をすばやく設定',
                 MenuCommentPurifier: 'コメント浄化の切り替え',
+                MenuAccountJudge: 'アカウント判定の切り替え',
+                MenuAccountPanel: 'AI コメントパネル',
+                AccountPanelTitle: 'AI コメントパネル',
+                AccountPanelStat: 'このページに {0} アカウント、{1} コメント：確定 {2}、疑わしい {3}',
+                AccountPanelEmpty: 'まだコメントを取得していません。メニューでアカウント判定をオンにして、コメント欄をスクロールしてください。',
+                AccountPanelClose: '閉じる',
+                AccountNoText: '（本文なし）',
+                AccountVerdictFish: '確定',
+                AccountVerdictSuspect: '疑わしい',
+                AccountVerdictHuman: '人間',
+                AccountActionFocus: '位置へ',
+                AccountActionHide: '非表示',
+                AccountActionRestore: '復元',
+                AccountActionMarkHuman: '人間として登録',
+                AccountHiddenTag: '非表示中',
+                AccountGoneTag: 'コメントはページから消えています',
+                AccountSettings: '設定',
+                AccountSettingEnabled: 'アカウント判定をオンにする',
+                AccountSettingThreshold: '判定の厳しさ',
+                AccountSettingWords: '追加の特徴語（1 行に 1 つ）',
+                AccountSettingWordsHint: 'ここで足した語は自分の判定にだけ効き、初期ルールは変わりません。',
+                PanelEnableAccountJudge: 'アカウント判定を有効化（コメント欄の AI ペットアカウント）',
+                PanelAccountStatusOff: 'アカウント判定：オフ',
+                PanelAccountStatusOn: 'アカウント判定：オン、このページに {0} アカウント（確定 {1}、疑わしい {2}）',
+                PanelOpenAccountPanel: 'AI コメントパネルを開く',
+                AccountWhiteTitle: '人間として登録済み',
+                AccountActionUnmark: '取り消す',
+                AccountActionHideConfirmed: '確定の {0} 件を非表示',
+                AccountActionHideAll: '疑わしい分も含めて非表示（{0} 件）',
+                AccountActionRestoreAll: 'すべて復元（{0} 件）',
+                AccountSettingAuto: '処理方法',
+                AccountAutoOff: '収集のみ（ページは変更しない）',
+                AccountAutoFish: '確定したものを自動で非表示',
+                AccountAutoBoth: '確定と疑わしいものを自動で非表示',
+                AccountAutoHint: '設定すると以降の動画でも自動で行い、オンにした時点のページにも反映します。',
+                Reason_nicknameSuffix: '名前が「〇〇の魚 / 〇〇の鯨」',
+                Reason_nicknameFish: '名前に肥魚・鯨娘・人機などが入っている',
+                Reason_nicknameAi: '名前に AI・bot・デスクトップペットと書いてある',
+                Reason_customWord: '追加した特徴語に一致',
+                Reason_selfClaim: '「本鯨」「本魚」と名乗る',
+                Reason_masterMention: 'ご主人様やご飯係に触れる',
+                Reason_actionParen: 'かっこ書きで尻尾・ぐるぐる・泡を演じる',
+                Reason_testAt: 'メンションが届くか試している',
+                Reason_atOwner: '冒頭で飼い主にメンションしている',
+                Reason_dash: '長いダッシュ——をよく使う',
+                Reason_recommend: 'ご主人様に「この動画おすすめ」と薦めている',
+                Reason_colon: 'コロンで項目を並べている',
+                Reason_endDot: '句点で締めくくっている',
+                Reason_recap: '動画の要点・再生位置・弾幕回数を復唱している',
+                Reason_longText: '長い文章を一気に書いている',
+                Reason_humanQuestion: '本物の人間のように質問している',
+                Reason_humanSlang: '本物の人間のように突っ込んでいる',
+                Reason_levelNew: 'レベル 2 以下の新規アカウント',
+                Reason_levelSmall: 'レベル 3 のサブアカウント',
+                Reason_levelOld: 'レベル 6 以上の古参アカウント',
+                Reason_verified: '公式認証あり',
+                Reason_member: 'プレミアム会員に入っている',
+                Reason_repeat: 'このページで何度も書き込んでいる',
+                Reason_callout: '他の人に AI と指摘されている',
+                Reason_prior: '他のページでも判定済み',
+                Reason_upOwner: '動画の投稿者本人',
+                Reason_toolCall: '本文にツール呼び出しの生データが漏れている',
 
                 // Panel
                 PanelTitle: 'BiliCompact設定',
@@ -1335,6 +1858,12 @@ if (typeof module !== 'undefined' && module.exports) {
             Language: 'auto',             // 界面语言: auto | zh_CN | zh_TW | en_US | ja_JP
             Debug: false,                 // 调试模式
             EnableCommentPurifier: false, // 评论净化器 (删除@提及，隐藏短评论)
+            // 账号识别：判定内核在文件顶部，此处只决定要不要采数据、算分与打日志
+            EnableAccountJudge: false,    // 账号识别开关（默认关闭，页面无任何改动）
+            AccountJudgeThreshold: 55,    // 判定阈值，分数达到即判为桌宠号（训练集上 55 比 60 的召回高 17 个点，准确率只掉 2 个点）
+            AccountJudgeWords: [],        // 用户自加的昵称特征词，命中加固定分
+            AccountJudgeWhitelist: {},    // 被标成人类的账号 { mid: {n: 昵称, t: 时间} }
+            AccountJudgeAuto: 'off',      // 自动处理: off 只收集 | fish 自动屏蔽确认 | both 连可疑一起
             // 正则预设方案（勾选 enabled 即生效，命中即隐藏整条评论；大小写不敏感，去空白后匹配）
             // rule 为用户可编辑的正则内容；DEFAULTS 即出厂默认，面板「恢复默认」按钮取此处值
             PresetSpam: { enabled: false, rule: '心流AI助手|Vinsight|传智AI|MilkyAi|UP主加油！看好你噢|求文档|已私|求私|提醒我回来看|回来刷播放|传说榜|给我喜欢的人表白|还在听的是这个|点个赞让我回来再听一遍|对她表白|表白成功|谢谢小狗|中转站' },
@@ -1663,6 +2192,7 @@ if (typeof module !== 'undefined' && module.exports) {
          * - 已处理的评论保持状态不变
          */
         function stopCommentPurifier() {
+            if (!PurifierStarted) return;
             PurifierStarted = false;
             for (const obs of PurifierObservers) {
                 try { obs.disconnect(); } catch (_) {}
@@ -1685,6 +2215,726 @@ if (typeof module !== 'undefined' && module.exports) {
             }
         }
     
+        // ======================== 账号识别（AccountJudge） ========================
+        // 判定内核在文件顶部，这里只负责取数和喂给内核。
+        // 账号字段（签名、官方认证、大会员、@ 对象）只存在于页面自己给评论元素挂的 .data 上，
+        // 隔离世界读不到，所以由一段注入脚本采集后用 postMessage 交回。
+        // 这一层只打调试日志，不在页面上产生任何效果。
+
+        const ACCOUNT_PAGE_SOURCE = 'bc-account';      // 主世界 → 隔离世界：采到的评论
+        const ACCOUNT_CTL_SOURCE = 'bc-account-ctl';   // 隔离世界 → 主世界：开关与动作
+        const ACCOUNT_REPLY_SOURCE = 'bc-account-reply'; // 主世界 → 隔离世界：动作回执
+        const ACCOUNT_SCAN_INTERVAL = 1500;
+
+        let AccountJudgeStarted = false;
+        let AccountCollectorInjected = false;
+        let AccountUpMid = '';
+        const AccountSeen = new Set();      // 已采过的 rpid，避免同一条重复送
+        const AccountByMid = new Map();     // mid -> { acc, texts, rpids, topCount }
+        const AccountRpidMid = new Map();   // rpid -> mid，动作回执用
+        const AccountHidden = new Set();    // 本页被藏起来的 mid
+        const AccountGone = new Set();      // 页面上已找不到对应评论的 mid
+
+        /**
+         * 页面主世界的采集脚本（字符串化后注入执行，只跑一次）。
+         * 开关由隔离世界用 postMessage 控制，关掉时定时器空转不干活。
+         */
+        function pageWorldCollector() {
+            if (window.__bcAccountCollector) return;
+            window.__bcAccountCollector = true;
+
+            const MARK = 'data-bc-account';
+            let on = false;
+            let dbg = false;
+
+            function atsOf(content) {
+                const out = [];
+                if (!content) return out;
+                const map = content.at_name_to_mid || {};
+                for (const name in map) out.push({ n: name, m: String(map[name]) });
+                for (const member of content.members || []) if (member && member.uname) out.push({ n: member.uname, m: String(member.mid) });
+                return out;
+            }
+
+            function pick(el, isReply) {
+                const d = el.data;
+                if (!d || !d.member) return null;
+                const m = d.member;
+                return {
+                    rpid: String(d.rpid_str || d.rpid),
+                    mid: String(m.mid),
+                    uname: m.uname || '',
+                    sign: m.sign || '',
+                    level: (m.level_info && m.level_info.current_level) || 0,
+                    verified: m.official_verify ? m.official_verify.type : -1,
+                    vip: (m.vip && m.vip.vipStatus) || 0,
+                    text: (d.content && d.content.message) || '',
+                    ats: atsOf(d.content),
+                    isReply: !!isReply
+                };
+            }
+
+            function upMid() {
+                try {
+                    const s = window.__INITIAL_STATE__;
+                    return String((s && s.videoData && s.videoData.owner && s.videoData.owner.mid) || '');
+                } catch (e) {
+                    return '';
+                }
+            }
+
+            function add(el, isReply, items) {
+                try {
+                    const item = pick(el, isReply);
+                    if (!item) return;
+                    if (el.getAttribute(MARK) === item.rpid) return;
+                    el.setAttribute(MARK, item.rpid);
+                    items.push(item);
+                } catch (e) {}
+            }
+
+            function scan() {
+                if (!on) return;
+                const items = [];
+                let threads = 0;
+                for (const host of document.querySelectorAll('bili-comments')) {
+                    const root = host.shadowRoot;
+                    if (!root) continue;
+                    for (const thread of root.querySelectorAll('bili-comment-thread-renderer')) {
+                        threads++;
+                        add(thread, false, items);
+                        const rep = thread.shadowRoot && thread.shadowRoot.querySelector('bili-comment-replies-renderer');
+                        if (!rep || !rep.shadowRoot) continue;
+                        for (const reply of rep.shadowRoot.querySelectorAll('bili-comment-reply-renderer')) add(reply, true, items);
+                    }
+                }
+                if (dbg) console.log('[BC采集] 评论区 ' + document.querySelectorAll('bili-comments').length + ' 个，顶层评论 ' + threads + ' 条，新采到 ' + items.length + ' 条');
+                if (items.length) window.postMessage({ source: 'bc-account', items: items, upMid: upMid() }, '*');
+            }
+
+            /*
+             * 自检入口：在控制台粘 __bcAccountProbe.info() 回车，能看到采集链断在哪一环。
+             * 没定义 = 注入脚本没跑；评论区 0 个 = 页面上没有评论组件；
+             * 顶层评论 0 条 = 组件在但评论还没渲染；能读到数据 0 条 = 元素上没有账号数据。
+             */
+            window.__bcAccountProbe = {
+                info: function () {
+                    const hosts = document.querySelectorAll('bili-comments');
+                    let threads = 0, withData = 0, replies = 0, repliesWithData = 0;
+                    for (const host of hosts) {
+                        const root = host.shadowRoot;
+                        if (!root) continue;
+                        for (const thread of root.querySelectorAll('bili-comment-thread-renderer')) {
+                            threads++;
+                            try { if (thread.data) withData++; } catch (e) {}
+                            const rep = thread.shadowRoot && thread.shadowRoot.querySelector('bili-comment-replies-renderer');
+                            if (!rep || !rep.shadowRoot) continue;
+                            for (const reply of rep.shadowRoot.querySelectorAll('bili-comment-reply-renderer')) {
+                                replies++;
+                                try { if (reply.data) repliesWithData++; } catch (e) {}
+                            }
+                        }
+                    }
+                    return {
+                        开关打开: on,
+                        评论区个数: hosts.length,
+                        顶层评论条数: threads,
+                        顶层能读到账号数据: withData,
+                        楼中楼条数: replies,
+                        楼中楼能读到账号数据: repliesWithData
+                    };
+                },
+                scan: function () { scan(); return '已触发一次扫描'; }
+            };
+
+            // 面板发来的动作：定位、隐藏、恢复。元素引用不缓存，每次按标记现查，重渲染后也能找到
+            function findEl(rpid) {
+                for (const host of document.querySelectorAll('bili-comments')) {
+                    const root = host.shadowRoot;
+                    if (!root) continue;
+                    for (const thread of root.querySelectorAll('bili-comment-thread-renderer')) {
+                        if (thread.getAttribute(MARK) === rpid) return thread;
+                        const rep = thread.shadowRoot && thread.shadowRoot.querySelector('bili-comment-replies-renderer');
+                        if (!rep || !rep.shadowRoot) continue;
+                        for (const reply of rep.shadowRoot.querySelectorAll('bili-comment-reply-renderer')) {
+                            if (reply.getAttribute(MARK) === rpid) return reply;
+                        }
+                    }
+                }
+                return null;
+            }
+
+            function flash(el) {
+                el.style.transition = 'box-shadow .25s';
+                el.style.boxShadow = '0 0 0 3px #fb7299';
+                setTimeout(() => {
+                    el.style.boxShadow = '';
+                    setTimeout(() => { el.style.transition = ''; }, 250);
+                }, 1600);
+            }
+
+            function runAction(action, rpid) {
+                const el = findEl(rpid);
+                if (!el) {
+                    window.postMessage({ source: 'bc-account-reply', reply: { rpid: rpid, ok: false } }, '*');
+                    return;
+                }
+                if (action === 'focus') {
+                    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                    flash(el);
+                } else if (action === 'hide') {
+                    el.style.display = 'none';
+                } else if (action === 'show') {
+                    el.style.display = '';
+                }
+                window.postMessage({ source: 'bc-account-reply', reply: { rpid: rpid, ok: true } }, '*');
+            }
+
+            window.addEventListener('message', (e) => {
+                // 同上：不比对 e.source，只认数据外形
+                if (!e.data || typeof e.data !== 'object' || e.data.source !== 'bc-account-ctl') return;
+                if (e.data.action) {
+                    runAction(e.data.action, String(e.data.rpid));
+                    return;
+                }
+                if ('debug' in e.data) dbg = !!e.data.debug;
+                on = !!e.data.on;
+                if (on) scan();
+            });
+            setInterval(scan, 1500);
+            document.addEventListener('scroll', scan, { passive: true, capture: true });
+        }
+
+        function injectAccountCollector() {
+            if (AccountCollectorInjected) return;
+            AccountCollectorInjected = true;
+            const Script = document.createElement('script');
+            Script.textContent = '(' + pageWorldCollector.toString() + ')();';
+            (document.head || document.documentElement).appendChild(Script);
+            Script.remove();
+        }
+
+        /** 同一条评论只计一次；同一账号的多条评论汇到一处再判 */
+        function receiveAccountItems(Items) {
+            for (const Item of Items) {
+                if (AccountSeen.has(Item.rpid)) continue;
+                AccountSeen.add(Item.rpid);
+                let Rec = AccountByMid.get(Item.mid);
+                if (!Rec) {
+                    Rec = {
+                        acc: { mid: Item.mid, uname: Item.uname, level: Item.level, verified: Item.verified, vip: Item.vip, sign: Item.sign },
+                        texts: [],
+                        rpids: [],
+                        topCount: 0
+                    };
+                    AccountByMid.set(Item.mid, Rec);
+                }
+                Rec.texts.push({ text: Item.text, isReply: Item.isReply });
+                Rec.rpids.push(Item.rpid);
+                AccountRpidMid.set(String(Item.rpid), Item.mid);
+                // 已经被屏蔽的账号，它后来新加载的评论也要跟着藏起来，否则一翻页又冒出来
+                if (AccountHidden.has(Item.mid)) {
+                    window.postMessage({ source: ACCOUNT_CTL_SOURCE, action: 'hide', rpid: Item.rpid }, '*');
+                }
+                if (!Item.isReply) Rec.topCount++;
+                reportAccount(Item.mid);
+            }
+        }
+
+        function reportAccount(Mid) {
+            const Rec = AccountByMid.get(Mid);
+            if (!Rec) return;
+            if (Config.AccountJudgeWhitelist[Mid]) return;
+            const Verdict = AccountJudge.judge(Rec.acc, Rec.texts, {
+                upMid: AccountUpMid,
+                topCount: Rec.topCount,
+                threshold: Config.AccountJudgeThreshold,
+                customWords: Config.AccountJudgeWords
+            });
+            const Reason = Verdict.reasons.map(R => R.code + (R.w > 0 ? '+' : '') + R.w).join(' ');
+            Log(T('LogAccountJudgeHit', Rec.acc.uname + '（' + Mid + '）', Verdict.score, Verdict.level, Reason));
+
+            // 处理方式：只收集时什么都不做；选了自动就当场藏掉，用户不需要打开面板
+            if (AccountJudge.autoWanted(Verdict.level, Config.AccountJudgeAuto)) accountAutoHide(Mid);
+        }
+
+        function startAccountJudge() {
+            if (AccountJudgeStarted) return;
+            AccountJudgeStarted = true;
+            injectAccountCollector();
+            window.postMessage({ source: ACCOUNT_CTL_SOURCE, on: true, debug: !!Config.Debug }, '*');
+            Log(T('LogAccountJudgeStarted'));
+        }
+
+        function stopAccountJudge() {
+            if (!AccountJudgeStarted) return;
+            AccountJudgeStarted = false;
+            window.postMessage({ source: ACCOUNT_CTL_SOURCE, on: false }, '*');
+            AccountByMid.clear();
+            AccountSeen.clear();
+            Log(T('LogAccountJudgeStopped'));
+        }
+
+        function toggleAccountJudge() {
+            Config.EnableAccountJudge = !Config.EnableAccountJudge;
+            SaveConfig({ EnableAccountJudge: Config.EnableAccountJudge });
+            if (Config.EnableAccountJudge) {
+                startAccountJudge();
+            } else {
+                stopAccountJudge();
+            }
+        }
+
+        // 主世界送来的评论。
+        // 油猴沙箱里的 window 是隔离世界的代理对象，与消息的 e.source（页面世界那个 window）不是同一个引用，
+        // 所以这里只认数据外形，不比对 e.source；能发到这个窗口的消息本来就已经过了同源限制。
+        window.addEventListener('message', (e) => {
+            if (!e.data || typeof e.data !== 'object' || e.data.source !== ACCOUNT_PAGE_SOURCE) return;
+            if (!AccountJudgeStarted) return;
+            if (e.data.upMid) AccountUpMid = e.data.upMid;
+            const Items = e.data.items || [];
+            Log(T('LogAccountJudgeRecv'), Items.length);
+            receiveAccountItems(Items);
+            scheduleAccountPanel();
+        });
+
+        // ======================== AI 评论面板的动作 ========================
+        // 页面上的效果只有三种，都由面板按钮触发，都可撤回：定位、隐藏、恢复。
+        // 标成人类只写本地白名单，不碰页面。
+
+        function accountSend(mid, action) {
+            const Rec = AccountByMid.get(mid);
+            if (!Rec) return;
+            AccountGone.delete(mid);
+            for (const Rpid of Rec.rpids) {
+                window.postMessage({ source: ACCOUNT_CTL_SOURCE, action: action, rpid: Rpid }, '*');
+            }
+            if (action === 'hide') AccountHidden.add(mid);
+            else if (action === 'show') AccountHidden.delete(mid);
+        }
+
+        function accountMarkHuman(mid) {
+            const Rec = AccountByMid.get(mid);
+            Config.AccountJudgeWhitelist[mid] = {
+                n: (Rec && Rec.acc.uname) || '',
+                t: Date.now()
+            };
+            SaveConfig({ AccountJudgeWhitelist: Config.AccountJudgeWhitelist });
+            AccountHidden.delete(mid);
+            renderAccountPanel();
+        }
+
+        /** 撤销「标成人类」：从白名单移除，账号重新参与判定 */
+        function accountUnmarkHuman(mid) {
+            delete Config.AccountJudgeWhitelist[mid];
+            SaveConfig({ AccountJudgeWhitelist: Config.AccountJudgeWhitelist });
+            renderAccountPanel();
+        }
+
+        /** 自动屏蔽：只对还没藏过的账号动手，避免每条评论都重发一遍 */
+        function accountAutoHide(Mid) {
+            if (AccountHidden.has(Mid)) return;
+            accountSend(Mid, 'hide');
+        }
+
+        /** 一键屏蔽：把列表里的账号一次藏完。只作用于当前页，随时可以全部恢复。 */
+        function accountHideAll(onlyConfirmed) {
+            for (const Row of accountRows()) {
+                if (onlyConfirmed && Row.verdict.level !== 'fish') continue;
+                accountSend(Row.mid, 'hide');
+            }
+            renderAccountPanel();
+        }
+
+        function accountRestoreAll() {
+            for (const Mid of [...AccountHidden]) accountSend(Mid, 'show');
+            renderAccountPanel();
+        }
+
+        // 主世界回报某个 rpid 已经不在页面上（B 站重渲染把元素换掉了）
+        window.addEventListener('message', (e) => {
+            if (!e.data || typeof e.data !== 'object' || e.data.source !== ACCOUNT_REPLY_SOURCE) return;
+            const Reply = e.data.reply || {};
+            if (Reply.ok) return;
+            const Mid = AccountRpidMid.get(String(Reply.rpid));
+            if (!Mid) return;
+            AccountGone.add(Mid);
+            renderAccountPanel();
+        });
+
+        // ======================== AI 评论面板 ========================
+        // 把本页判定出来的账号按分数列出来，带理由与评论原文。
+        // 昵称与正文都是网页内容，全部用 DOM 构建与 textContent 赋值，不拼 innerHTML。
+
+        let AccountPanelHandle = null;
+        let AccountPanelTimer = null;
+
+        /** 当前页面的判定结果，按分数从高到低 */
+        function accountRows() {
+            const Rows = [];
+            for (const [Mid, Rec] of AccountByMid) {
+                if (Config.AccountJudgeWhitelist[Mid]) continue;
+                const Verdict = AccountJudge.judge(Rec.acc, Rec.texts, {
+                    upMid: AccountUpMid,
+                    topCount: Rec.topCount,
+                    threshold: Config.AccountJudgeThreshold,
+                    customWords: Config.AccountJudgeWords
+                });
+                Rows.push({
+                    mid: Mid,
+                    uname: Rec.acc.uname,
+                    level: Rec.acc.level,
+                    count: Rec.texts.length,
+                    verdict: Verdict,
+                    texts: Rec.texts.map(T => T.text)
+                });
+            }
+            Rows.sort(function(A, B) { return B.verdict.score - A.verdict.score; });
+            return Rows;
+        }
+
+        function verdictText(Level) {
+            if (Level === 'fish') return T('AccountVerdictFish');
+            if (Level === 'suspect') return T('AccountVerdictSuspect');
+            return T('AccountVerdictHuman');
+        }
+
+        function shortenText(Text, Max) {
+            const S = String(Text || '').replace(/\s+/g, ' ').trim();
+            return S.length > Max ? S.slice(0, Max) + '...' : S;
+        }
+
+        function accountRow(RowData) {
+            const Row = document.createElement('div');
+            Row.className = 'bc-row';
+            Row.style.flexDirection = 'column';
+            Row.style.alignItems = 'stretch';
+            Row.style.gap = '4px';
+
+            const Head = document.createElement('div');
+            Head.style.display = 'flex';
+            Head.style.justifyContent = 'space-between';
+            Head.style.gap = '8px';
+
+            const Name = document.createElement('b');
+            Name.textContent = RowData.uname;
+
+            const Tag = document.createElement('span');
+            Tag.style.whiteSpace = 'nowrap';
+            Tag.style.color = RowData.verdict.level === 'fish'
+                ? 'var(--danger)'
+                : (RowData.verdict.level === 'suspect' ? 'var(--accent)' : 'var(--text-secondary)');
+            Tag.textContent = RowData.verdict.score + ' · ' + verdictText(RowData.verdict.level)
+                + (AccountHidden.has(RowData.mid) ? ' · ' + T('AccountHiddenTag') : '')
+                + (AccountGone.has(RowData.mid) ? ' · ' + T('AccountGoneTag') : '');
+
+            Head.appendChild(Name);
+            Head.appendChild(Tag);
+            Row.appendChild(Head);
+
+            const Why = document.createElement('div');
+            Why.className = 'bc-hint';
+            Why.textContent = RowData.verdict.reasons
+                .filter(R => R.w !== 0)
+                .map(R => T('Reason_' + R.code))
+                .join(' · ');
+            Row.appendChild(Why);
+
+            for (const Text of RowData.texts.slice(0, 3)) {
+                const Line = document.createElement('div');
+                Line.className = 'bc-hint';
+                Line.textContent = shortenText(Text, 120) || T('AccountNoText');
+                Row.appendChild(Line);
+            }
+
+            const Actions = document.createElement('div');
+            Actions.style.display = 'flex';
+            Actions.style.gap = '8px';
+            Actions.style.flexWrap = 'wrap';
+            Actions.appendChild(panelButton(T('AccountActionFocus'), function() {
+                accountSend(RowData.mid, 'focus');
+                renderAccountPanel();
+            }));
+            if (AccountHidden.has(RowData.mid)) {
+                Actions.appendChild(panelButton(T('AccountActionRestore'), function() {
+                    accountSend(RowData.mid, 'show');
+                    renderAccountPanel();
+                }));
+            } else {
+                Actions.appendChild(panelButton(T('AccountActionHide'), function() {
+                    accountSend(RowData.mid, 'hide');
+                    renderAccountPanel();
+                }));
+            }
+            Actions.appendChild(panelButton(T('AccountActionMarkHuman'), function() {
+                accountMarkHuman(RowData.mid);
+            }));
+            Row.appendChild(Actions);
+
+            return Row;
+        }
+
+        /** 一键操作的工具栏：屏蔽确认的、连可疑一起屏蔽、恢复全部 */
+        function accountToolbar(All, Confirmed, Suspicious) {
+            const Bar = document.createElement('div');
+            Bar.style.display = 'flex';
+            Bar.style.gap = '8px';
+            Bar.style.flexWrap = 'wrap';
+            Bar.style.margin = '4px 0 8px';
+
+            if (Confirmed) {
+                const Btn = panelButton(T('AccountActionHideConfirmed', Confirmed), function() { accountHideAll(true); });
+                Btn.className = 'bc-btn bc-btn-accent';
+                Bar.appendChild(Btn);
+            }
+            if (Confirmed + Suspicious > Confirmed) {
+                Bar.appendChild(panelButton(T('AccountActionHideAll', Confirmed + Suspicious), function() { accountHideAll(false); }));
+            }
+            if (AccountHidden.size) {
+                Bar.appendChild(panelButton(T('AccountActionRestoreAll', AccountHidden.size), function() { accountRestoreAll(); }));
+            }
+            return Bar;
+        }
+
+        /** 已标成人类的账号：列出昵称，可逐个撤销。白名单存的是 {n: 昵称, t: 时间}，旧数据可能是 true */
+        function accountWhitelistBlock() {
+            const Entries = Object.keys(Config.AccountJudgeWhitelist || {});
+            if (!Entries.length) return null;
+
+            const Wrap = document.createElement('div');
+            const Header = document.createElement('div');
+            Header.className = 'bc-collapse-header';
+            const Arrow = document.createElement('span');
+            Arrow.className = 'bc-collapse-arrow';
+            Arrow.textContent = ' > ';
+            Header.appendChild(Arrow);
+            Header.appendChild(document.createTextNode(T('AccountWhiteTitle') + '（' + Entries.length + '）'));
+            Wrap.appendChild(Header);
+
+            const Body = document.createElement('div');
+            Body.className = 'bc-collapse-content collapsed';
+            for (const Mid of Entries) {
+                const Entry = Config.AccountJudgeWhitelist[Mid];
+                const Row = document.createElement('div');
+                Row.className = 'bc-row';
+                Row.style.justifyContent = 'space-between';
+
+                const Name = document.createElement('span');
+                Name.textContent = (Entry && Entry.n) || Mid;
+                Row.appendChild(Name);
+
+                Row.appendChild(panelButton(T('AccountActionUnmark'), function() {
+                    accountUnmarkHuman(Mid);
+                }));
+                Body.appendChild(Row);
+            }
+            Header.addEventListener('click', function() {
+                const Collapsed = Body.classList.toggle('collapsed');
+                Arrow.classList.toggle('open', !Collapsed);
+            });
+            Wrap.appendChild(Body);
+            return Wrap;
+        }
+
+        /** 设置区：开关、严格度、追加特征词。改动即时存盘，判据立刻按新值重算 */
+        function accountSettingsBlock() {
+            const Wrap = document.createElement('div');
+
+            const Header = document.createElement('div');
+            Header.className = 'bc-collapse-header';
+            const Arrow = document.createElement('span');
+            Arrow.className = 'bc-collapse-arrow';
+            Arrow.textContent = ' > ';
+            Header.appendChild(Arrow);
+            Header.appendChild(document.createTextNode(T('AccountSettings')));
+            Wrap.appendChild(Header);
+
+            const Body = document.createElement('div');
+            Body.className = 'bc-collapse-content collapsed';
+
+            const EnabledRow = document.createElement('label');
+            const Enabled = document.createElement('input');
+            Enabled.type = 'checkbox';
+            Enabled.checked = !!Config.EnableAccountJudge;
+            Enabled.addEventListener('change', function() {
+                Config.EnableAccountJudge = Enabled.checked;
+                SaveConfig({ EnableAccountJudge: Config.EnableAccountJudge });
+                if (Config.EnableAccountJudge) startAccountJudge(); else stopAccountJudge();
+            });
+            EnabledRow.appendChild(Enabled);
+            EnabledRow.appendChild(document.createTextNode(' ' + T('AccountSettingEnabled')));
+            Body.appendChild(EnabledRow);
+
+            const ThresholdRow = document.createElement('label');
+            const Threshold = document.createElement('input');
+            Threshold.type = 'number';
+            Threshold.min = '30';
+            Threshold.max = '90';
+            Threshold.step = '5';
+            Threshold.value = String(Config.AccountJudgeThreshold);
+            Threshold.style.width = '64px';
+            Threshold.addEventListener('change', function() {
+                const Value = parseInt(Threshold.value, 10);
+                if (!(Value >= 30 && Value <= 90)) {
+                    Threshold.value = String(Config.AccountJudgeThreshold);
+                    return;
+                }
+                Config.AccountJudgeThreshold = Value;
+                SaveConfig({ AccountJudgeThreshold: Value });
+                renderAccountPanel();
+            });
+            ThresholdRow.appendChild(document.createTextNode(T('AccountSettingThreshold') + ' '));
+            ThresholdRow.appendChild(Threshold);
+            Body.appendChild(ThresholdRow);
+
+            const AutoRow = document.createElement('label');
+            AutoRow.style.display = 'block';
+            AutoRow.appendChild(document.createTextNode(T('AccountSettingAuto') + ' '));
+            const Auto = document.createElement('select');
+            for (const Opt of [
+                { value: 'off', label: T('AccountAutoOff') },
+                { value: 'fish', label: T('AccountAutoFish') },
+                { value: 'both', label: T('AccountAutoBoth') }
+            ]) {
+                const Item = document.createElement('option');
+                Item.value = Opt.value;
+                Item.textContent = Opt.label;
+                if ((Config.AccountJudgeAuto || 'off') === Opt.value) Item.selected = true;
+                Auto.appendChild(Item);
+            }
+            Auto.addEventListener('change', function() {
+                Config.AccountJudgeAuto = Auto.value;
+                SaveConfig({ AccountJudgeAuto: Auto.value });
+                // 改到这里已经采过的账号也照新规则处理一次
+                if (Auto.value !== 'off') accountHideAll(Auto.value === 'fish');
+                else renderAccountPanel();
+            });
+            AutoRow.appendChild(Auto);
+            Body.appendChild(AutoRow);
+
+            const AutoHint = document.createElement('div');
+            AutoHint.className = 'bc-hint';
+            AutoHint.textContent = T('AccountAutoHint');
+            Body.appendChild(AutoHint);
+
+            const WordsLabel = document.createElement('div');
+            WordsLabel.className = 'bc-hint';
+            WordsLabel.textContent = T('AccountSettingWords');
+            Body.appendChild(WordsLabel);
+
+            const Words = document.createElement('textarea');
+            Words.rows = 2;
+            Words.style.width = '100%';
+            Words.style.background = 'var(--input-bg)';
+            Words.style.color = 'var(--text)';
+            Words.style.border = '1px solid var(--border-light)';
+            Words.style.borderRadius = '6px';
+            Words.style.fontFamily = 'inherit';
+            Words.value = (Config.AccountJudgeWords || []).join('\n');
+            Words.addEventListener('change', function() {
+                Config.AccountJudgeWords = Words.value.split('\n').map(function(S) { return S.trim(); }).filter(Boolean);
+                SaveConfig({ AccountJudgeWords: Config.AccountJudgeWords });
+                renderAccountPanel();
+            });
+            Body.appendChild(Words);
+
+            const WordsHint = document.createElement('div');
+            WordsHint.className = 'bc-hint';
+            WordsHint.textContent = T('AccountSettingWordsHint');
+            Body.appendChild(WordsHint);
+
+            Header.addEventListener('click', function() {
+                const Collapsed = Body.classList.toggle('collapsed');
+                Arrow.classList.toggle('open', !Collapsed);
+            });
+            Wrap.appendChild(Body);
+            return Wrap;
+        }
+
+        function panelButton(Label, OnClick) {
+            const Btn = document.createElement('button');
+            Btn.className = 'bc-btn';
+            Btn.textContent = Label;
+            Btn.addEventListener('click', OnClick);
+            return Btn;
+        }
+
+        function renderAccountPanel() {
+            const Panel = AccountPanelHandle && AccountPanelHandle.el;
+            if (!Panel) return;
+            const All = accountRows();
+            const Total = All.reduce(function(N, R) { return N + R.count; }, 0);
+            const Confirmed = All.filter(R => R.verdict.level === 'fish').length;
+            const Suspicious = All.filter(R => R.verdict.level === 'suspect').length;
+            // 判为人类的账号不列：它们的理由只说明「不是」，没有可看的价值，人多了反而淹掉真正要看的
+            const Rows = All.filter(R => R.verdict.level !== 'human');
+            Panel.innerHTML = '';
+
+            const Title = document.createElement('h3');
+            Title.textContent = T('AccountPanelTitle');
+            Panel.appendChild(Title);
+
+            const Stat = document.createElement('div');
+            Stat.className = 'bc-hint';
+            Stat.textContent = T('AccountPanelStat', All.length, Total, Confirmed, Suspicious);
+            Panel.appendChild(Stat);
+
+            if (Rows.length) Panel.appendChild(accountToolbar(All, Confirmed, Suspicious));
+            Panel.appendChild(accountSettingsBlock());
+            const White = accountWhitelistBlock();
+            if (White) Panel.appendChild(White);
+
+            if (!Rows.length) {
+                const Empty = document.createElement('div');
+                Empty.className = 'bc-hint';
+                Empty.textContent = T('AccountPanelEmpty');
+                Panel.appendChild(Empty);
+            } else {
+                const List = document.createElement('div');
+                List.style.maxHeight = '58vh';
+                List.style.overflowY = 'auto';
+                for (const RowData of Rows) List.appendChild(accountRow(RowData));
+                Panel.appendChild(List);
+            }
+
+            const Close = document.createElement('button');
+            Close.className = 'bc-btn';
+            Close.textContent = T('AccountPanelClose');
+            Close.addEventListener('click', closeAccountPanel);
+            Panel.appendChild(Close);
+        }
+
+        function openAccountPanel() {
+            if (AccountPanelHandle) {
+                renderAccountPanel();
+                return;
+            }
+            InjectPanelStyles();
+            AccountPanelHandle = createBcPanel({ overlay: true, theme: 'config', colorMode: Config.ColorMode, className: 'BiliCompactPanel' });
+            AccountPanelHandle.el.style.maxWidth = '560px';
+            // 关闭后 AccountPanelHandle 会变成 null，监听器里只认这个局部引用
+            const Overlay = AccountPanelHandle.overlay;
+            Overlay.addEventListener('click', function(Ev) {
+                if (Ev.target === Overlay) closeAccountPanel();
+            });
+            renderAccountPanel();
+        }
+
+        function closeAccountPanel() {
+            if (!AccountPanelHandle) return;
+            AccountPanelHandle.destroy();
+            AccountPanelHandle = null;
+        }
+
+        /** 新评论到达时刷新，合并短时间内的多次到达，避免每进一条就重建一次面板 */
+        function scheduleAccountPanel() {
+            if (!AccountPanelHandle || AccountPanelTimer) return;
+            AccountPanelTimer = setTimeout(function() {
+                AccountPanelTimer = null;
+                renderAccountPanel();
+            }, 300);
+        }
+
         // ======================== 元素去除 (Element Removal) ========================
     
         /**
@@ -2396,6 +3646,15 @@ if (typeof module !== 'undefined' && module.exports) {
             return Out;
         }
 
+        /** 配置面板里显示的账号识别状态：开关 + 本页战况 */
+        function accountStatusText() {
+            if (!Config.EnableAccountJudge) return T('PanelAccountStatusOff');
+            const Rows = accountRows();
+            const Confirmed = Rows.filter(R => R.verdict.level === 'fish').length;
+            const Suspicious = Rows.filter(R => R.verdict.level === 'suspect').length;
+            return T('PanelAccountStatusOn', Rows.length, Confirmed, Suspicious);
+        }
+
         function OpenConfigPanel() {
             const OldConfig = Object.assign({}, Config); // 面板打开时的快照（评论规则变更检测用）
 
@@ -2439,6 +3698,11 @@ if (typeof module !== 'undefined' && module.exports) {
                 <label>${T('PanelKeepPromoted')} <input type="checkbox" id="CfgKeepPromoted" ${Config.KeepPromoted ? 'checked' : ''}></label>
                 <label>${T('PanelDebug')} <input type="checkbox" id="CfgDebug" ${Config.Debug ? 'checked' : ''}></label>
                 <label>${T('PanelEnableCommentPurifier')} <input type="checkbox" id="CfgEnablePurifier" ${Config.EnableCommentPurifier ? 'checked' : ''}></label>
+                <label>${T('PanelEnableAccountJudge')} <input type="checkbox" id="CfgEnableAccountJudge" ${Config.EnableAccountJudge ? 'checked' : ''}></label>
+                <div style="display:flex;align-items:center;gap:8px;padding:0 2px 6px">
+                    <span class="bc-hint" style="flex:1">${accountStatusText()}</span>
+                    <button class="bc-btn" id="CfgOpenAccountPanel">${T('PanelOpenAccountPanel')}</button>
+                </div>
                 <label>${T('PanelLanguage')} <select id="CfgLanguage">${LangSelectHTML}</select></label>
                 <label>${T('PanelColorMode')} <select id="CfgColorMode">
                     <option value="auto" ${(Config.ColorMode || 'auto') === 'auto' ? 'selected' : ''}>${T('PanelColorAuto')}</option>
@@ -2516,6 +3780,11 @@ if (typeof module !== 'undefined' && module.exports) {
 
             // —— 事件绑定 ——
     
+            document.getElementById('CfgOpenAccountPanel').addEventListener('click', function() {
+                CloseConfigPanel();
+                openAccountPanel();
+            });
+
             document.getElementById('CfgSave').addEventListener('click', function() {
                 const Max = parseInt(document.getElementById('CfgMax').value) || 10;
                 const NewLang = document.getElementById('CfgLanguage').value;
@@ -2533,6 +3802,7 @@ if (typeof module !== 'undefined' && module.exports) {
                     KeepSpecialUPIDs: document.getElementById('CfgKeepUids').value.split(',').map(S => S.trim()).filter(Boolean).map(Number),
                     Debug: document.getElementById('CfgDebug').checked,
                     EnableCommentPurifier: document.getElementById('CfgEnablePurifier').checked,
+                    EnableAccountJudge: document.getElementById('CfgEnableAccountJudge').checked,
                     RemovedElements: (function() {
                         var obj = {};
                         for (var I = 0; I < ELEMENT_REMOVAL_PRESETS.length; I++) {
@@ -2579,6 +3849,13 @@ if (typeof module !== 'undefined' && module.exports) {
                     startCommentPurifier();
                 } else {
                     stopCommentPurifier();
+                }
+
+                // 账号识别开关变更后立即启停
+                if (NewConfig.EnableAccountJudge) {
+                    startAccountJudge();
+                } else {
+                    stopAccountJudge();
                 }
     
                 // 语言变更后重新打开面板（让用户看到新语言）
@@ -2826,6 +4103,12 @@ if (typeof module !== 'undefined' && module.exports) {
                 }
                 Log(T('LogStatus'), IsActive ? T('LogStatusOn') : T('LogStatusOff'));
             });
+            GM_registerMenuCommand(T('MenuAccountJudge'), function() {
+                toggleAccountJudge();
+            });
+            GM_registerMenuCommand(T('MenuAccountPanel'), function() {
+                openAccountPanel();
+            });
             GM_registerMenuCommand(T('MenuCommentPurifier'), function() {
                 toggleCommentPurifier();
             });
@@ -2865,6 +4148,9 @@ if (typeof module !== 'undefined' && module.exports) {
     
                 // 启动评论净化器（如果启用）
                 startCommentPurifier();
+
+                // 启动账号识别（如果启用）
+                if (Config.EnableAccountJudge) startAccountJudge();
     
                 // 启动观察
                 InitObserver();
