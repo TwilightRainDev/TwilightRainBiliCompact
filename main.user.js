@@ -2232,8 +2232,13 @@ if (typeof module !== 'undefined' && module.exports) {
         const AccountSeen = new Set();      // 已采过的 rpid，避免同一条重复送
         const AccountByMid = new Map();     // mid -> { acc, texts, rpids, topCount }
         const AccountRpidMid = new Map();   // rpid -> mid，动作回执用
-        const AccountHidden = new Set();    // 本页被藏起来的 mid
+        // 屏蔽按规则走，不按动作走：每次扫描或设置变化都重算一遍期望状态，再幂等下发给页面。
+        // 评论净化器是同一套路，好处是新加载的评论天然会被算进去，不会漏。
+        const AccountHidden = new Set();    // 用户单独点过「隐藏」的账号
+        const AccountRestored = new Set();  // 用户单独点过「恢复」的账号，压过自动档，本页内不再自动藏它
         const AccountGone = new Set();      // 页面上已找不到对应评论的 mid
+        const AccountApplied = new Map();   // rpid -> 'hide' | 'show'，记录已经下发过的状态，避免重复发
+        let AccountPageMode = 'off';        // 本页的一键屏蔽档位：off | fish | both
 
         /**
          * 页面主世界的采集脚本（字符串化后注入执行，只跑一次）。
@@ -2432,13 +2437,11 @@ if (typeof module !== 'undefined' && module.exports) {
                 Rec.texts.push({ text: Item.text, isReply: Item.isReply });
                 Rec.rpids.push(Item.rpid);
                 AccountRpidMid.set(String(Item.rpid), Item.mid);
-                // 已经被屏蔽的账号，它后来新加载的评论也要跟着藏起来，否则一翻页又冒出来
-                if (AccountHidden.has(Item.mid)) {
-                    window.postMessage({ source: ACCOUNT_CTL_SOURCE, action: 'hide', rpid: Item.rpid }, '*');
-                }
                 if (!Item.isReply) Rec.topCount++;
                 reportAccount(Item.mid);
             }
+            // 新到的评论也要过一遍规则，不然一翻页又冒出来
+            accountApply();
         }
 
         function reportAccount(Mid) {
@@ -2454,8 +2457,7 @@ if (typeof module !== 'undefined' && module.exports) {
             const Reason = Verdict.reasons.map(R => R.code + (R.w > 0 ? '+' : '') + R.w).join(' ');
             Log(T('LogAccountJudgeHit', Rec.acc.uname + '（' + Mid + '）', Verdict.score, Verdict.level, Reason));
 
-            // 处理方式：只收集时什么都不做；选了自动就当场藏掉，用户不需要打开面板
-            if (AccountJudge.autoWanted(Verdict.level, Config.AccountJudgeAuto)) accountAutoHide(Mid);
+
         }
 
         function startAccountJudge() {
@@ -2502,15 +2504,29 @@ if (typeof module !== 'undefined' && module.exports) {
         // 页面上的效果只有三种，都由面板按钮触发，都可撤回：定位、隐藏、恢复。
         // 标成人类只写本地白名单，不碰页面。
 
-        function accountSend(mid, action) {
-            const Rec = AccountByMid.get(mid);
-            if (!Rec) return;
-            AccountGone.delete(mid);
-            for (const Rpid of Rec.rpids) {
-                window.postMessage({ source: ACCOUNT_CTL_SOURCE, action: action, rpid: Rpid }, '*');
+        /** 一个账号此刻该不该藏：白名单与用户点过恢复的一律不藏，其余按手动与两处档位判定 */
+        function accountDesiredHidden(Mid, Level) {
+            if (Config.AccountJudgeWhitelist[Mid]) return false;
+            if (AccountRestored.has(Mid)) return false;
+            if (AccountHidden.has(Mid)) return true;
+            return AccountJudge.autoWanted(Level, Config.AccountJudgeAuto)
+                || AccountJudge.autoWanted(Level, AccountPageMode);
+        }
+
+        /** 把期望状态同步到页面，只发与上次不同的那些 */
+        function accountApply() {
+            const Levels = new Map();
+            for (const Row of accountRows()) Levels.set(Row.mid, Row.verdict.level);
+            for (const [Mid, Rec] of AccountByMid) {
+                if (!Rec.rpids.length) continue;
+                const Action = accountDesiredHidden(Mid, Levels.get(Mid)) ? 'hide' : 'show';
+                for (const Rpid of Rec.rpids) {
+                    if (AccountApplied.get(Rpid) === Action) continue;
+                    AccountGone.delete(Mid);
+                    window.postMessage({ source: ACCOUNT_CTL_SOURCE, action: Action, rpid: Rpid }, '*');
+                    AccountApplied.set(Rpid, Action);
+                }
             }
-            if (action === 'hide') AccountHidden.add(mid);
-            else if (action === 'show') AccountHidden.delete(mid);
         }
 
         function accountMarkHuman(mid) {
@@ -2521,6 +2537,8 @@ if (typeof module !== 'undefined' && module.exports) {
             };
             SaveConfig({ AccountJudgeWhitelist: Config.AccountJudgeWhitelist });
             AccountHidden.delete(mid);
+            AccountRestored.delete(mid);
+            accountApply();
             renderAccountPanel();
         }
 
@@ -2528,26 +2546,48 @@ if (typeof module !== 'undefined' && module.exports) {
         function accountUnmarkHuman(mid) {
             delete Config.AccountJudgeWhitelist[mid];
             SaveConfig({ AccountJudgeWhitelist: Config.AccountJudgeWhitelist });
+            accountApply();
             renderAccountPanel();
         }
 
-        /** 自动屏蔽：只对还没藏过的账号动手，避免每条评论都重发一遍 */
-        function accountAutoHide(Mid) {
-            if (AccountHidden.has(Mid)) return;
-            accountSend(Mid, 'hide');
+        /** 单个账号：隐藏 */
+        function accountHideOne(Mid) {
+            AccountHidden.add(Mid);
+            AccountRestored.delete(Mid);
+            accountApply();
+            renderAccountPanel();
         }
 
-        /** 一键屏蔽：把列表里的账号一次藏完。只作用于当前页，随时可以全部恢复。 */
+        /** 单个账号：恢复（本页内压过自动档） */
+        function accountRestoreOne(Mid) {
+            AccountHidden.delete(Mid);
+            AccountRestored.add(Mid);
+            accountApply();
+            renderAccountPanel();
+        }
+
+        /**
+         * 一键屏蔽：把本页档位设成 fish 或 both，之后新扫进来的账号也照同一档处理，
+         * 不是只对眼前的列表做一次快照。
+         */
         function accountHideAll(onlyConfirmed) {
-            for (const Row of accountRows()) {
-                if (onlyConfirmed && Row.verdict.level !== 'fish') continue;
-                accountSend(Row.mid, 'hide');
-            }
+            AccountPageMode = onlyConfirmed ? 'fish' : 'both';
+            AccountRestored.clear();
+            accountApply();
             renderAccountPanel();
         }
 
+        /** 恢复全部：本页档位归零，当前藏着的一律恢复，且本页内不再被自动档重新藏起来 */
         function accountRestoreAll() {
-            for (const Mid of [...AccountHidden]) accountSend(Mid, 'show');
+            const Levels = new Map();
+            for (const Row of accountRows()) Levels.set(Row.mid, Row.verdict.level);
+            for (const Mid of AccountByMid.keys()) {
+                if (!accountDesiredHidden(Mid, Levels.get(Mid))) continue;
+                AccountRestored.add(Mid);
+            }
+            AccountHidden.clear();
+            AccountPageMode = 'off';
+            accountApply();
             renderAccountPanel();
         }
 
@@ -2604,7 +2644,14 @@ if (typeof module !== 'undefined' && module.exports) {
             return S.length > Max ? S.slice(0, Max) + '...' : S;
         }
 
-        function accountRow(RowData) {
+        function accountFocus(Mid) {
+            const Rec = AccountByMid.get(Mid);
+            if (!Rec || !Rec.rpids.length) return;
+            AccountGone.delete(Mid);
+            window.postMessage({ source: ACCOUNT_CTL_SOURCE, action: 'focus', rpid: Rec.rpids[0] }, '*');
+        }
+
+        function accountRow(RowData, Hidden) {
             const Row = document.createElement('div');
             Row.className = 'bc-row';
             Row.style.flexDirection = 'column';
@@ -2625,7 +2672,7 @@ if (typeof module !== 'undefined' && module.exports) {
                 ? 'var(--danger)'
                 : (RowData.verdict.level === 'suspect' ? 'var(--accent)' : 'var(--text-secondary)');
             Tag.textContent = RowData.verdict.score + ' · ' + verdictText(RowData.verdict.level)
-                + (AccountHidden.has(RowData.mid) ? ' · ' + T('AccountHiddenTag') : '')
+                + (Hidden ? ' · ' + T('AccountHiddenTag') : '')
                 + (AccountGone.has(RowData.mid) ? ' · ' + T('AccountGoneTag') : '');
 
             Head.appendChild(Name);
@@ -2652,18 +2699,15 @@ if (typeof module !== 'undefined' && module.exports) {
             Actions.style.gap = '8px';
             Actions.style.flexWrap = 'wrap';
             Actions.appendChild(panelButton(T('AccountActionFocus'), function() {
-                accountSend(RowData.mid, 'focus');
-                renderAccountPanel();
+                accountFocus(RowData.mid);
             }));
-            if (AccountHidden.has(RowData.mid)) {
+            if (Hidden) {
                 Actions.appendChild(panelButton(T('AccountActionRestore'), function() {
-                    accountSend(RowData.mid, 'show');
-                    renderAccountPanel();
+                    accountRestoreOne(RowData.mid);
                 }));
             } else {
                 Actions.appendChild(panelButton(T('AccountActionHide'), function() {
-                    accountSend(RowData.mid, 'hide');
-                    renderAccountPanel();
+                    accountHideOne(RowData.mid);
                 }));
             }
             Actions.appendChild(panelButton(T('AccountActionMarkHuman'), function() {
@@ -2675,7 +2719,7 @@ if (typeof module !== 'undefined' && module.exports) {
         }
 
         /** 一键操作的工具栏：屏蔽确认的、连可疑一起屏蔽、恢复全部 */
-        function accountToolbar(All, Confirmed, Suspicious) {
+        function accountToolbar(Confirmed, Suspicious, HiddenCount) {
             const Bar = document.createElement('div');
             Bar.style.display = 'flex';
             Bar.style.gap = '8px';
@@ -2690,8 +2734,8 @@ if (typeof module !== 'undefined' && module.exports) {
             if (Confirmed + Suspicious > Confirmed) {
                 Bar.appendChild(panelButton(T('AccountActionHideAll', Confirmed + Suspicious), function() { accountHideAll(false); }));
             }
-            if (AccountHidden.size) {
-                Bar.appendChild(panelButton(T('AccountActionRestoreAll', AccountHidden.size), function() { accountRestoreAll(); }));
+            if (HiddenCount) {
+                Bar.appendChild(panelButton(T('AccountActionRestoreAll', HiddenCount), function() { accountRestoreAll(); }));
             }
             return Bar;
         }
@@ -2868,6 +2912,7 @@ if (typeof module !== 'undefined' && module.exports) {
             const Suspicious = All.filter(R => R.verdict.level === 'suspect').length;
             // 判为人类的账号不列：它们的理由只说明「不是」，没有可看的价值，人多了反而淹掉真正要看的
             const Rows = All.filter(R => R.verdict.level !== 'human');
+            const HiddenNow = new Set(All.filter(R => accountDesiredHidden(R.mid, R.verdict.level)).map(R => R.mid));
             Panel.innerHTML = '';
 
             const Title = document.createElement('h3');
@@ -2879,7 +2924,7 @@ if (typeof module !== 'undefined' && module.exports) {
             Stat.textContent = T('AccountPanelStat', All.length, Total, Confirmed, Suspicious);
             Panel.appendChild(Stat);
 
-            if (Rows.length) Panel.appendChild(accountToolbar(All, Confirmed, Suspicious));
+            if (Rows.length) Panel.appendChild(accountToolbar(Confirmed, Suspicious, HiddenNow.size));
             Panel.appendChild(accountSettingsBlock());
             const White = accountWhitelistBlock();
             if (White) Panel.appendChild(White);
@@ -2893,7 +2938,7 @@ if (typeof module !== 'undefined' && module.exports) {
                 const List = document.createElement('div');
                 List.style.maxHeight = '58vh';
                 List.style.overflowY = 'auto';
-                for (const RowData of Rows) List.appendChild(accountRow(RowData));
+                for (const RowData of Rows) List.appendChild(accountRow(RowData, HiddenNow.has(RowData.mid)));
                 Panel.appendChild(List);
             }
 
