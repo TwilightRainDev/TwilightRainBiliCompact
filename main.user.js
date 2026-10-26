@@ -4,7 +4,7 @@
 // @name:zh-TW   網頁端Bilibili主頁精簡~ BiliCompact
 // @name:ja      Web版Bilibiliのhomepageの簡素化
 // @namespace    http://tampermonkey.net/
-// @version      2.11.0
+// @version      2.11.2
 // @license MIT
 // @description  Tired of Bilibili's cluttered video feed? This plugin limits visible videos per page, supports multi‑page, black/whitelists, and persistent settings. It also spots automated AI pet accounts in the comments and can hide them for you. No UI injected, 4 languages supported. Locally, there are 0 network requests.
 // @description:zh-CN   厌倦网页视频过多？本插件限制显示数量，支持多页、黑白名单、持久配置；评论区的 AI 桌宠号可按账号识别并自动屏蔽。无UI注入，四语言。收藏夹本地重命名，零网络请求。
@@ -1241,6 +1241,7 @@ if (typeof module !== 'undefined' && module.exports) {
                 AccountAutoFish: '自动屏蔽确认的',
                 AccountAutoBoth: '自动屏蔽确认与可疑',
                 AccountAutoHint: '选定后每进一个视频都会自动照做，开关打开时立即对当前页生效。',
+                AccountToolbarHint: '上面三个按钮也会改「处理方式」：屏蔽会记下这一档，恢复全部把它改回只收集。',
                 Reason_nicknameSuffix: '昵称是「某某的鱼 / 某某の鲸」',
                 Reason_nicknameFish: '昵称里有肥鱼、鲸娘、人机这类词',
                 Reason_nicknameAi: '昵称里写明 AI、bot、桌宠',
@@ -1403,6 +1404,7 @@ if (typeof module !== 'undefined' && module.exports) {
                 AccountAutoFish: '自動屏蔽確認的',
                 AccountAutoBoth: '自動屏蔽確認與可疑',
                 AccountAutoHint: '選定後每進一個影片都會自動照做，開關開啟時立即對當前頁生效。',
+                AccountToolbarHint: '上面三個按鈕也會改「處理方式」：屏蔽會記下這一檔，恢復全部把它改回只收集。',
                 Reason_nicknameSuffix: '暱稱是「某某的魚 / 某某の鯨」',
                 Reason_nicknameFish: '暱稱裡有肥魚、鯨娘、人機這類詞',
                 Reason_nicknameAi: '暱稱裡寫明 AI、bot、桌寵',
@@ -1565,6 +1567,7 @@ if (typeof module !== 'undefined' && module.exports) {
                 AccountAutoFish: 'Hide confirmed automatically',
                 AccountAutoBoth: 'Hide confirmed and suspicious automatically',
                 AccountAutoHint: 'Applies to every video once set, and takes effect on this page right away.',
+                AccountToolbarHint: 'These buttons also change What to do: hiding remembers the choice, Restore all sets it back to collect only.',
                 Reason_nicknameSuffix: 'Name ends with "owner + fish/whale"',
                 Reason_nicknameFish: 'Name mentions a fish, whale girl or 人机',
                 Reason_nicknameAi: 'Name mentions AI, bot or desktop pet',
@@ -1727,6 +1730,7 @@ if (typeof module !== 'undefined' && module.exports) {
                 AccountAutoFish: '確定したものを自動で非表示',
                 AccountAutoBoth: '確定と疑わしいものを自動で非表示',
                 AccountAutoHint: '設定すると以降の動画でも自動で行い、オンにした時点のページにも反映します。',
+                AccountToolbarHint: '上のボタンは「処理方法」も変更します：非表示はその設定を記憶し、すべて復元は収集のみに戻します。',
                 Reason_nicknameSuffix: '名前が「〇〇の魚 / 〇〇の鯨」',
                 Reason_nicknameFish: '名前に肥魚・鯨娘・人機などが入っている',
                 Reason_nicknameAi: '名前に AI・bot・デスクトップペットと書いてある',
@@ -2571,7 +2575,11 @@ if (typeof module !== 'undefined' && module.exports) {
          * 不是只对眼前的列表做一次快照。
          */
         function accountHideAll(onlyConfirmed) {
-            AccountPageMode = onlyConfirmed ? 'fish' : 'both';
+            const Mode = onlyConfirmed ? 'fish' : 'both';
+            AccountPageMode = Mode;
+            // 一键屏蔽同时把处理方式记下来：用户点这一下想的是「以后都这样」，刷新后仍然按它执行
+            Config.AccountJudgeAuto = Mode;
+            SaveConfig({ AccountJudgeAuto: Mode });
             AccountRestored.clear();
             accountApply();
             renderAccountPanel();
@@ -2587,6 +2595,9 @@ if (typeof module !== 'undefined' && module.exports) {
             }
             AccountHidden.clear();
             AccountPageMode = 'off';
+            // 对称处理：一键屏蔽改过处理方式，恢复全部就把它改回来，否则下个视频又自动藏
+            Config.AccountJudgeAuto = 'off';
+            SaveConfig({ AccountJudgeAuto: 'off' });
             accountApply();
             renderAccountPanel();
         }
@@ -2737,6 +2748,12 @@ if (typeof module !== 'undefined' && module.exports) {
             if (HiddenCount) {
                 Bar.appendChild(panelButton(T('AccountActionRestoreAll', HiddenCount), function() { accountRestoreAll(); }));
             }
+
+            const Hint = document.createElement('div');
+            Hint.className = 'bc-hint';
+            Hint.style.flexBasis = '100%';
+            Hint.textContent = T('AccountToolbarHint');
+            Bar.appendChild(Hint);
             return Bar;
         }
 
