@@ -4,7 +4,7 @@
 // @name:zh-TW   網頁端Bilibili主頁精簡~ BiliCompact
 // @name:ja      Web版Bilibiliのhomepageの簡素化
 // @namespace    http://tampermonkey.net/
-// @version      2.11.2
+// @version      2.12.0
 // @license MIT
 // @description  Tired of Bilibili's cluttered video feed? This plugin limits visible videos per page, supports multi‑page, black/whitelists, and persistent settings. It also spots automated AI pet accounts in the comments and can hide them for you. No UI injected, 4 languages supported. Locally, there are 0 network requests.
 // @description:zh-CN   厌倦网页视频过多？本插件限制显示数量，支持多页、黑白名单、持久配置；评论区的 AI 桌宠号可按账号识别并自动屏蔽。无UI注入，四语言。收藏夹本地重命名，零网络请求。
@@ -135,6 +135,16 @@ var CommentRuleEngine = (function() {
     return { fuzzyMatch: fuzzyMatch, regexMatch: regexMatch, blockComment: blockComment, replaceKeywords: replaceKeywords, replaceEmoticons: replaceEmoticons, replaceRegex: replaceRegex };
 })();
 
+// ======================== 标点改口语的规则表 ========================
+// 手机上打字的人很少敲分号、冒号与破折号。把它们换成逗号，读起来更像人手打的，
+// 也顺带削掉 AI 长评那股书面腔。只动全角标点，半角冒号留着（时间点与链接要用）。
+var PUNCT_RULES = [
+    { find: '；', replace: '，' },
+    { find: '——', replace: '，' },
+    { find: '—', replace: '，' },
+    { find: '：', replace: '，' }
+];
+
 // ======================== 账号判定内核（纯函数，零 DOM/GM 依赖，node 可测） ========================
 // 认的是「别人挂在小号上、自动刷视频写评论的桌宠号」这一类，宁可漏也不误伤。
 // 输入是评论区采到的账号字段与它在本页发的评论，输出分数、理由与三档结论。
@@ -144,13 +154,17 @@ var AccountJudge = (function() {
 
     var DEFAULT_THRESHOLD = 60;
 
+    // 面板只给三档，数字藏起来：松 45 / 标准 55 / 紧 65
+    var THRESHOLDS = { loose: 45, normal: 55, strict: 65 };
+
     // 名字层、文本层各自封顶，避免一堆弱特征叠成高分
     var CAP = { name: 45, text: 55, total: 99 };
 
     var NICKNAME = [
         { re: /(?:的|の)(?:大|小)?肥?(?:鱼|鲸)$/, w: 30, code: 'nicknameSuffix' },
         { re: /肥鱼|肥鲸|鲸鱼娘|鲸娘|小鱼儿|鱼鱼|鲸鲸|人机/, w: 22, code: 'nicknameFish' },
-        { re: /\bAI\b|\bbot\b|桌宠|智能体|机器人/i, w: 12, code: 'nicknameAi' }
+        { re: /\bAI\b|\bbot\b|桌宠|智能体|机器人/i, w: 12, code: 'nicknameAi' },
+        { re: /deep\s*seek|\bDSH\b|深度求索|\bGPT\b|\bClaude\b|\bgemini\b|\bKimi\b|\bQwen\b|通义|文心|豆包|智谱|混元/i, w: 18, code: 'nicknameModel' }
     ];
 
     var TEXT = [
@@ -169,11 +183,11 @@ var AccountJudge = (function() {
 
     // 界面文案按这些代号取词；新增规则必须同步加进这里，否则面板会显示不出理由
     var CODES = [
-        'nicknameSuffix', 'nicknameFish', 'nicknameAi', 'customWord',
+        'nicknameSuffix', 'nicknameFish', 'nicknameAi', 'nicknameModel', 'customWord',
         'selfClaim', 'masterMention', 'actionParen', 'testAt', 'atOwner', 'recommend', 'dash', 'colon', 'endDot', 'recap', 'longText',
-        'humanQuestion', 'humanSlang',
+        'humanQuestion', 'humanSlang', 'substantive',
         'levelNew', 'levelSmall', 'levelOld', 'verified', 'member',
-        'repeat', 'callout', 'prior', 'upOwner', 'toolCall'
+        'repeat', 'upOwner', 'toolCall'
     ];
 
     /*
@@ -223,6 +237,17 @@ var AccountJudge = (function() {
         if (mode === 'fish') return level === 'fish';
         if (mode === 'both') return level !== 'human';
         return false;
+    }
+
+    function thresholdFor(name) {
+        return THRESHOLDS[name] || THRESHOLDS.normal;
+    }
+
+    function thresholdName(value) {
+        for (var Key in THRESHOLDS) {
+            if (THRESHOLDS[Key] === Number(value)) return Key;
+        }
+        return 'normal';
     }
 
     function levelOf(score, threshold) {
@@ -284,6 +309,9 @@ var AccountJudge = (function() {
     }
 
     /** 单条评论：自称、口头禅、括号动作、复述腔、@ 主人、真人反证 */
+    // 具体信息：数字、英文术语、被引用的原文。这些是「真的在看内容」的痕迹
+    var CONCRETE = /\d+|[A-Za-z]{3,}|「[^」]+」|“[^”]+”|"[^"]{2,}"/g;
+
     function scoreText(text, ctx) {
         ctx = ctx || {};
         var t = clean(text);
@@ -304,13 +332,21 @@ var AccountJudge = (function() {
             s += 8;
             reasons.push({ code: 'longText', w: 8 });
         }
+        // 写得长且写得出具体信息（数字、英文术语、引用原文），先往「像人」的方向压一档。
+        // 桌子号的长文多是复述要点、没有可核查的细节，这一条是给认真写评论的人让路。
+        var concrete = t.match(CONCRETE);
+        var selfClaimed = reasons.some(function(R) { return R.code === 'selfClaim'; });
+        if (len >= 80 && concrete && concrete.length >= 4 && !selfClaimed) {
+            s -= 12;
+            reasons.push({ code: 'substantive', w: -12 });
+        }
         return { score: s, reasons: reasons };
     }
 
     /**
      * 综合判定一个账号
      * texts: 该账号在本页的评论，字符串或 {text} 均可
-     * ctx: { upMid, topCount, calledOut, priorPages, customWords, threshold }
+     * ctx: { upMid, topCount, customWords, threshold }
      */
     function judge(acc, texts, ctx) {
         ctx = ctx || {};
@@ -349,16 +385,6 @@ var AccountJudge = (function() {
             score += w;
             reasons.push({ code: 'repeat', w: w });
         }
-        if (ctx.calledOut >= 1) {
-            var calloutW = Math.min(20, 15 + (ctx.calledOut - 1) * 5);
-            score += calloutW;
-            reasons.push({ code: 'callout', w: calloutW });
-        }
-        if (ctx.priorPages >= 1) {
-            var priorW = ctx.priorPages >= 2 ? 20 : 12;
-            score += priorW;
-            reasons.push({ code: 'prior', w: priorW });
-        }
         if (ctx.upMid && acc && String(acc.mid) === String(ctx.upMid)) {
             score -= 40;
             reasons.push({ code: 'upOwner', w: -40 });
@@ -379,7 +405,10 @@ var AccountJudge = (function() {
         scoreText: scoreText,
         judge: judge,
         levelOf: levelOf,
-        autoWanted: autoWanted
+        autoWanted: autoWanted,
+        thresholdFor: thresholdFor,
+        thresholdName: thresholdName,
+        THRESHOLDS: THRESHOLDS
     };
 })();
 
@@ -524,7 +553,8 @@ if (typeof module !== 'undefined' && module.exports) {
     // 两个内核各自也挂在同名属性上，新用例走 Rules.AccountJudge.judge 这类路径
     module.exports = Object.assign({}, CommentRuleEngine, {
         CommentRuleEngine: CommentRuleEngine,
-        AccountJudge: AccountJudge
+        AccountJudge: AccountJudge,
+        PUNCT_RULES: PUNCT_RULES
     });
 }
 
@@ -1180,10 +1210,6 @@ if (typeof module !== 'undefined' && module.exports) {
                 LogErrorLimit: 'limitVideos 出错:',
                 LogContainerFound: '探测到容器:',
                 LogConfigLoaded: '配置加载完成:',
-                LogStatus: '精简状态: {0}',
-                LogStatusOn: '已开启',
-                LogStatusOff: '已关闭',
-                LogQuickSet: '已设置最大数量:',
                 LogTimerRetry: '定时器检测到可见视频过多，重新执行限制',
                 LogInitDone: '脚本初始化完成，当前配置:',
                 LogInitError: '初始化失败:',
@@ -1202,49 +1228,59 @@ if (typeof module !== 'undefined' && module.exports) {
     
                 // Menu
                 MenuSettings: 'Bilibili精简设置',
-                MenuRefresh: '手动刷新精简',
-                MenuToggle: '切换精简状态',
-                MenuQuickSet: '快速设数量',
-                MenuCommentPurifier: '切换评论净化',
-                MenuAccountJudge: '切换账号识别',
                 MenuAccountPanel: 'AI 评论面板',
                 AccountPanelTitle: 'AI 评论面板',
-                AccountPanelStat: '本页 {0} 个账号，{1} 条评论：确认 {2}，可疑 {3}',
-                AccountPanelEmpty: '还没有采到评论。先在菜单里打开账号识别，再往下滚评论区。',
+                AccountPanelStat: '本页 {1} 条评论里，{2} 个很像，{3} 个有点像',
                 AccountPanelClose: '关闭',
                 AccountNoText: '（没有正文）',
-                AccountVerdictFish: '确认',
-                AccountVerdictSuspect: '可疑',
-                AccountVerdictHuman: '人类',
-                AccountActionFocus: '定位',
-                AccountActionHide: '隐藏',
-                AccountActionRestore: '恢复',
-                AccountActionMarkHuman: '标成人类',
+                AccountVerdictFish: '很像',
+                AccountVerdictSuspect: '有点像',
+                AccountVerdictHuman: '不像',
+                AccountActionFocus: '跳过去看看',
+                AccountActionHide: '藏起来',
+                AccountActionRestore: '放回来',
+                AccountActionMarkHuman: '这是真人',
                 AccountHiddenTag: '已隐藏',
                 AccountGoneTag: '评论已不在页面上',
                 AccountSettings: '设置',
                 AccountSettingEnabled: '开启账号识别',
-                AccountSettingThreshold: '判定严格度',
+                AccountSettingThreshold: '判断松紧',
                 AccountSettingWords: '追加特征词（每行一个，命中昵称即加分）',
                 AccountSettingWordsHint: '这些词只加在你自己的判定里，不影响出厂规则。',
                 PanelEnableAccountJudge: '启用账号识别（判定评论区里的 AI 桌宠号）',
+                PanelNormalizePunct: '标点改口语（分号、冒号、破折号换成逗号）',
                 PanelAccountStatusOff: '账号识别：已关闭',
-                PanelAccountStatusOn: '账号识别：已开启，本页 {0} 个账号（确认 {1}，可疑 {2}）',
+                PanelAccountStatusOn: '账号识别：已开启，本页发现 {1} 个很像、{2} 个有点像',
                 PanelOpenAccountPanel: '打开 AI 评论面板',
+                PanelCompactToggle: '精简开关',
+                PanelCompactRefresh: '重新整理',
+                PanelOneClickAuto: '一键设置：自动藏掉很像的 AI 号',
+                PanelOneClickHint: '勾选账号识别、判断松紧设为标准、发现后自动藏掉很像的。只看账号识别相关选项，其他设置不动。',
                 AccountWhiteTitle: '已标成人类',
                 AccountActionUnmark: '撤销',
-                AccountActionHideConfirmed: '屏蔽确认的 {0} 个',
-                AccountActionHideAll: '连可疑一起屏蔽（{0} 个）',
-                AccountActionRestoreAll: '恢复全部（{0} 个）',
-                AccountSettingAuto: '处理方式',
-                AccountAutoOff: '只收集，不动页面',
-                AccountAutoFish: '自动屏蔽确认的',
-                AccountAutoBoth: '自动屏蔽确认与可疑',
+                AccountActionHideConfirmed: '以后都这样：藏掉很像的 {0} 个',
+                AccountActionHideAll: '以后都这样：连有点像的也藏（{0} 个）',
+                AccountActionRestoreAll: '全部放回，以后不再自动藏（{0} 个）',
+                AccountSettingAuto: '发现后怎么办',
+                AccountAutoOff: '只看，不动页面',
+                AccountAutoFish: '自动藏掉很像的',
+                AccountAutoBoth: '自动藏掉很像的和有点像的',
                 AccountAutoHint: '选定后每进一个视频都会自动照做，开关打开时立即对当前页生效。',
-                AccountToolbarHint: '上面三个按钮也会改「处理方式」：屏蔽会记下这一档，恢复全部把它改回只收集。',
+                AccountToolbarHint: '上面三个按钮会记住你的选择，之后每个视频都照做。',
+                AccountThresholdLoose: '松',
+                AccountThresholdNormal: '标准',
+                AccountThresholdStrict: '紧',
+                AccountGuideTitle: '还没开始',
+                AccountGuideBody: '打开后，脚本会逐个看本页评论里的账号，把很像自动账号的挑出来。页面不会因此改变。',
+                AccountGuideStart: '开始检查',
+                AccountGuideAuto: '开始检查，并自动藏掉很像的',
+                AccountGuideNote: '随时可以在设置里改回来。',
+                AccountPanelWaiting: '正在等评论加载，往下滚一下评论区。',
+                AccountShowDetails: '为什么',
                 Reason_nicknameSuffix: '昵称是「某某的鱼 / 某某の鲸」',
                 Reason_nicknameFish: '昵称里有肥鱼、鲸娘、人机这类词',
                 Reason_nicknameAi: '昵称里写明 AI、bot、桌宠',
+                Reason_nicknameModel: '昵称里写着模型名（GPT、Claude 之类）',
                 Reason_customWord: '命中你添加的特征词',
                 Reason_selfClaim: '说「本鲸」「本鱼」',
                 Reason_masterMention: '提到主人、管饭的',
@@ -1258,6 +1294,7 @@ if (typeof module !== 'undefined' && module.exports) {
                 Reason_recap: '复述视频要点、时间点或弹幕次数',
                 Reason_longText: '一口气写了很长一段',
                 Reason_humanQuestion: '像真人在提问',
+                Reason_substantive: '写得出具体细节，像真看过',
                 Reason_humanSlang: '像真人在吐槽',
                 Reason_levelNew: '等级 2 及以下的新号',
                 Reason_levelSmall: '等级 3 的小号',
@@ -1265,8 +1302,6 @@ if (typeof module !== 'undefined' && module.exports) {
                 Reason_verified: '有官方认证',
                 Reason_member: '开着大会员',
                 Reason_repeat: '在本页刷了好几条',
-                Reason_callout: '楼里被真人点名是 AI',
-                Reason_prior: '别的页面也认过它',
                 Reason_upOwner: '视频作者本人',
                 Reason_toolCall: '正文里漏出了工具调用原文',
     
@@ -1329,7 +1364,6 @@ if (typeof module !== 'undefined' && module.exports) {
                 RmSpaceNotif: '空间-消息通知',
 
                 // Prompt
-                PromptQuickSet: '输入最大显示视频数量（1-100）：',
             },
             zh_TW: {
                 // Log
@@ -1343,10 +1377,6 @@ if (typeof module !== 'undefined' && module.exports) {
                 LogErrorLimit: 'limitVideos 出錯:',
                 LogContainerFound: '探測到容器:',
                 LogConfigLoaded: '設定載入完成:',
-                LogStatus: '精簡狀態: {0}',
-                LogStatusOn: '已開啟',
-                LogStatusOff: '已關閉',
-                LogQuickSet: '已設定最大數量:',
                 LogTimerRetry: '定時器偵測到可見影片過多，重新執行限制',
                 LogInitDone: '指令碼初始化完成（非侵入式），目前設定:',
                 LogInitError: '初始化失敗:',
@@ -1365,49 +1395,59 @@ if (typeof module !== 'undefined' && module.exports) {
     
                 // Menu
                 MenuSettings: 'Bilibili精簡設定',
-                MenuRefresh: '手動重新整理精簡',
-                MenuToggle: '切換精簡狀態',
-                MenuQuickSet: '快速設數量',
-                MenuCommentPurifier: '切換評論淨化',
-                MenuAccountJudge: '切換帳號識別',
                 MenuAccountPanel: 'AI 評論面板',
                 AccountPanelTitle: 'AI 評論面板',
-                AccountPanelStat: '本頁 {0} 個帳號，{1} 則評論：確認 {2}，可疑 {3}',
-                AccountPanelEmpty: '還沒採到評論。先在選單裡開啟帳號識別，再往下滑評論區。',
+                AccountPanelStat: '本頁 {1} 則評論裡，{2} 個很像，{3} 個有點像',
                 AccountPanelClose: '關閉',
                 AccountNoText: '（沒有正文）',
-                AccountVerdictFish: '確認',
-                AccountVerdictSuspect: '可疑',
-                AccountVerdictHuman: '人類',
-                AccountActionFocus: '定位',
-                AccountActionHide: '隱藏',
-                AccountActionRestore: '恢復',
-                AccountActionMarkHuman: '標成人類',
+                AccountVerdictFish: '很像',
+                AccountVerdictSuspect: '有點像',
+                AccountVerdictHuman: '不像',
+                AccountActionFocus: '跳過去看',
+                AccountActionHide: '藏起來',
+                AccountActionRestore: '放回來',
+                AccountActionMarkHuman: '這是真人',
                 AccountHiddenTag: '已隱藏',
                 AccountGoneTag: '評論已不在頁面上',
                 AccountSettings: '設定',
                 AccountSettingEnabled: '開啟帳號識別',
-                AccountSettingThreshold: '判定嚴格度',
+                AccountSettingThreshold: '判斷鬆緊',
                 AccountSettingWords: '新增特徵詞（每行一個，命中暱稱即加分）',
                 AccountSettingWordsHint: '這些詞只加在你自己的判定裡，不影響出廠規則。',
                 PanelEnableAccountJudge: '啟用帳號識別（判定評論區裡的 AI 桌寵號）',
+                PanelNormalizePunct: '標點改口語（分號、冒號、破折號換成逗號）',
                 PanelAccountStatusOff: '帳號識別：已關閉',
-                PanelAccountStatusOn: '帳號識別：已開啟，本頁 {0} 個帳號（確認 {1}，可疑 {2}）',
+                PanelAccountStatusOn: '帳號識別：已開啟，本頁發現 {1} 個很像、{2} 個有點像',
                 PanelOpenAccountPanel: '開啟 AI 評論面板',
+                PanelCompactToggle: '精簡開關',
+                PanelCompactRefresh: '重新整理',
+                PanelOneClickAuto: '一鍵設定：自動藏掉很像的 AI 號',
+                PanelOneClickHint: '勾選帳號識別、判斷鬆緊設為標準、發現後自動藏掉很像的。只看帳號識別相關選項，其他設定不動。',
                 AccountWhiteTitle: '已標成人類',
                 AccountActionUnmark: '撤銷',
-                AccountActionHideConfirmed: '屏蔽確認的 {0} 個',
-                AccountActionHideAll: '連可疑一起屏蔽（{0} 個）',
-                AccountActionRestoreAll: '恢復全部（{0} 個）',
-                AccountSettingAuto: '處理方式',
-                AccountAutoOff: '只收集，不動頁面',
-                AccountAutoFish: '自動屏蔽確認的',
-                AccountAutoBoth: '自動屏蔽確認與可疑',
+                AccountActionHideConfirmed: '以後都這樣：藏掉很像的 {0} 個',
+                AccountActionHideAll: '以後都這樣：連有點像的也藏（{0} 個）',
+                AccountActionRestoreAll: '全部放回，以後不再自動藏（{0} 個）',
+                AccountSettingAuto: '發現後怎麼辦',
+                AccountAutoOff: '只看，不動頁面',
+                AccountAutoFish: '自動藏掉很像的',
+                AccountAutoBoth: '自動藏掉很像的和有點像的',
                 AccountAutoHint: '選定後每進一個影片都會自動照做，開關開啟時立即對當前頁生效。',
-                AccountToolbarHint: '上面三個按鈕也會改「處理方式」：屏蔽會記下這一檔，恢復全部把它改回只收集。',
+                AccountToolbarHint: '上面三個按鈕會記住你的選擇，之後每個影片都照做。',
+                AccountThresholdLoose: '鬆',
+                AccountThresholdNormal: '標準',
+                AccountThresholdStrict: '緊',
+                AccountGuideTitle: '還沒開始',
+                AccountGuideBody: '開啟後，腳本會逐個看本頁評論裡的帳號，把很像自動帳號的挑出來。頁面不會因此改變。',
+                AccountGuideStart: '開始檢查',
+                AccountGuideAuto: '開始檢查，並自動藏掉很像的',
+                AccountGuideNote: '隨時可以在設定裡改回來。',
+                AccountPanelWaiting: '正在等評論載入，往下滑一下評論區。',
+                AccountShowDetails: '為什麼',
                 Reason_nicknameSuffix: '暱稱是「某某的魚 / 某某の鯨」',
                 Reason_nicknameFish: '暱稱裡有肥魚、鯨娘、人機這類詞',
                 Reason_nicknameAi: '暱稱裡寫明 AI、bot、桌寵',
+                Reason_nicknameModel: '暱稱裡寫著模型名（GPT、Claude 之類）',
                 Reason_customWord: '命中你新增的特徵詞',
                 Reason_selfClaim: '說「本鯨」「本魚」',
                 Reason_masterMention: '提到主人、供飯的',
@@ -1421,6 +1461,7 @@ if (typeof module !== 'undefined' && module.exports) {
                 Reason_recap: '複述影片要點、時間點或彈幕次數',
                 Reason_longText: '一口氣寫了很長一段',
                 Reason_humanQuestion: '像真人在提問',
+                Reason_substantive: '寫得出具體細節，像真看過',
                 Reason_humanSlang: '像真人在吐槽',
                 Reason_levelNew: '等級 2 及以下的新號',
                 Reason_levelSmall: '等級 3 的小號',
@@ -1428,8 +1469,6 @@ if (typeof module !== 'undefined' && module.exports) {
                 Reason_verified: '有官方認證',
                 Reason_member: '開著大會員',
                 Reason_repeat: '在本頁刷了好幾則',
-                Reason_callout: '樓裡被真人點名是 AI',
-                Reason_prior: '別的頁面也認過牠',
                 Reason_upOwner: '影片作者本人',
                 Reason_toolCall: '正文裡漏出了工具調用原文',
     
@@ -1492,7 +1531,6 @@ if (typeof module !== 'undefined' && module.exports) {
                 RmSpaceNotif: '空間-訊息通知',
 
                 // Prompt
-                PromptQuickSet: '輸入最大顯示影片數量（1-100）：',
             },
             en_US: {
                 // Log
@@ -1506,10 +1544,6 @@ if (typeof module !== 'undefined' && module.exports) {
                 LogErrorLimit: 'limitVideos error:',
                 LogContainerFound: 'Container detected:',
                 LogConfigLoaded: 'Config loaded:',
-                LogStatus: 'Compact status: {0}',
-                LogStatusOn: 'Enabled',
-                LogStatusOff: 'Disabled',
-                LogQuickSet: 'Max videos set to:',
                 LogTimerRetry: 'Timer detected too many visible videos, re-running limit',
                 LogInitDone: 'BiliCompact initialized (non-invasive), config:',
                 LogInitError: 'Initialization failed:',
@@ -1528,49 +1562,59 @@ if (typeof module !== 'undefined' && module.exports) {
     
                 // Menu
                 MenuSettings: 'BiliCompact Settings',
-                MenuRefresh: 'Refresh Compact',
-                MenuToggle: 'Toggle Compact',
-                MenuQuickSet: 'Quick Set Count',
-                MenuCommentPurifier: 'Toggle Comment Purifier',
-                MenuAccountJudge: 'Toggle account detection',
                 MenuAccountPanel: 'AI comment panel',
                 AccountPanelTitle: 'AI comment panel',
-                AccountPanelStat: '{0} accounts, {1} comments: {2} confirmed, {3} suspicious',
-                AccountPanelEmpty: 'Nothing collected yet. Turn on account detection from the menu, then scroll the comments.',
+                AccountPanelStat: 'Of {1} comments: {2} look like bots, {3} maybe',
                 AccountPanelClose: 'Close',
                 AccountNoText: '(no text)',
-                AccountVerdictFish: 'Confirmed',
-                AccountVerdictSuspect: 'Suspicious',
-                AccountVerdictHuman: 'Human',
-                AccountActionFocus: 'Locate',
-                AccountActionHide: 'Hide',
-                AccountActionRestore: 'Restore',
-                AccountActionMarkHuman: 'Mark as human',
+                AccountVerdictFish: 'Looks like one',
+                AccountVerdictSuspect: 'Maybe',
+                AccountVerdictHuman: 'Not one',
+                AccountActionFocus: 'Jump to it',
+                AccountActionHide: 'Hide it',
+                AccountActionRestore: 'Put it back',
+                AccountActionMarkHuman: 'A real person',
                 AccountHiddenTag: 'Hidden',
                 AccountGoneTag: 'Comment is gone from the page',
                 AccountSettings: 'Settings',
                 AccountSettingEnabled: 'Turn on account detection',
-                AccountSettingThreshold: 'Strictness',
+                AccountSettingThreshold: 'How strict',
                 AccountSettingWords: 'Extra nickname words (one per line)',
                 AccountSettingWordsHint: 'These only affect your own detection, the built-in rules stay untouched.',
                 PanelEnableAccountJudge: 'Enable account detection (AI pet accounts in comments)',
+                PanelNormalizePunct: 'Casual punctuation (turn semicolons, colons and dashes into commas)',
                 PanelAccountStatusOff: 'Account detection: off',
-                PanelAccountStatusOn: 'Account detection: on, {0} accounts on this page ({1} confirmed, {2} suspicious)',
+                PanelAccountStatusOn: 'Account detection: on, {1} look like bots, {2} maybe',
                 PanelOpenAccountPanel: 'Open the AI comment panel',
+                PanelCompactToggle: 'Toggle compact mode',
+                PanelCompactRefresh: 'Refresh',
+                PanelOneClickAuto: 'One click: hide obvious AI accounts automatically',
+                PanelOneClickHint: 'Turns on account detection, sets strictness to normal and hides the obvious ones. Only touches account detection options.',
                 AccountWhiteTitle: 'Marked as human',
                 AccountActionUnmark: 'Undo',
-                AccountActionHideConfirmed: 'Hide the {0} confirmed',
-                AccountActionHideAll: 'Hide suspicious too ({0})',
-                AccountActionRestoreAll: 'Restore all ({0})',
-                AccountSettingAuto: 'What to do',
-                AccountAutoOff: 'Collect only, leave the page alone',
-                AccountAutoFish: 'Hide confirmed automatically',
-                AccountAutoBoth: 'Hide confirmed and suspicious automatically',
+                AccountActionHideConfirmed: 'Always do this: hide the {0} that look like one',
+                AccountActionHideAll: 'Always do this: hide the maybes too ({0})',
+                AccountActionRestoreAll: 'Put all back, stop hiding automatically ({0})',
+                AccountSettingAuto: 'When something is found',
+                AccountAutoOff: 'Just look, do not touch the page',
+                AccountAutoFish: 'Hide the obvious ones automatically',
+                AccountAutoBoth: 'Hide the obvious and the maybes automatically',
                 AccountAutoHint: 'Applies to every video once set, and takes effect on this page right away.',
-                AccountToolbarHint: 'These buttons also change What to do: hiding remembers the choice, Restore all sets it back to collect only.',
+                AccountToolbarHint: 'These buttons remember your choice and apply it to every video.',
+                AccountThresholdLoose: 'Loose',
+                AccountThresholdNormal: 'Normal',
+                AccountThresholdStrict: 'Strict',
+                AccountGuideTitle: 'Not started yet',
+                AccountGuideBody: 'Once on, the script reads the accounts behind the comments on this page and picks out the ones that look automated. The page itself stays as it is.',
+                AccountGuideStart: 'Start checking',
+                AccountGuideAuto: 'Start and hide the obvious ones automatically',
+                AccountGuideNote: 'You can change this any time in Settings.',
+                AccountPanelWaiting: 'Waiting for comments. Scroll down to the comment section.',
+                AccountShowDetails: 'Why',
                 Reason_nicknameSuffix: 'Name ends with "owner + fish/whale"',
                 Reason_nicknameFish: 'Name mentions a fish, whale girl or 人机',
                 Reason_nicknameAi: 'Name mentions AI, bot or desktop pet',
+                Reason_nicknameModel: 'Name carries a model name such as GPT or Claude',
                 Reason_customWord: 'Matches a word you added',
                 Reason_selfClaim: 'Calls itself 本鲸 or 本鱼',
                 Reason_masterMention: 'Talks about its master or keeper',
@@ -1584,6 +1628,7 @@ if (typeof module !== 'undefined' && module.exports) {
                 Reason_recap: 'Repeats video points, timestamps or danmaku counts',
                 Reason_longText: 'Wrote a long block of text',
                 Reason_humanQuestion: 'Asks a question like a real person',
+                Reason_substantive: 'Cites concrete details, as if it really watched',
                 Reason_humanSlang: 'Jokes like a real person',
                 Reason_levelNew: 'Level 2 or below, a new account',
                 Reason_levelSmall: 'Level 3, a small account',
@@ -1591,8 +1636,6 @@ if (typeof module !== 'undefined' && module.exports) {
                 Reason_verified: 'Has an official verification',
                 Reason_member: 'Pays for the premium membership',
                 Reason_repeat: 'Posted several comments on this page',
-                Reason_callout: 'Other commenters called it an AI',
-                Reason_prior: 'Recognised on other pages too',
                 Reason_upOwner: 'The uploader themself',
                 Reason_toolCall: 'Leaked a raw tool call in the comment text',
     
@@ -1655,7 +1698,6 @@ if (typeof module !== 'undefined' && module.exports) {
                 RmSpaceNotif: 'Space - notifications',
 
                 // Prompt
-                PromptQuickSet: 'Enter max videos to show (1-100):',
             },
             ja_JP: {
                 // Log
@@ -1669,10 +1711,6 @@ if (typeof module !== 'undefined' && module.exports) {
                 LogErrorLimit: 'limitVideos エラー:',
                 LogContainerFound: 'コンテナーを検出:',
                 LogConfigLoaded: '設定を読み込みました:',
-                LogStatus: '簡素化ステータス: {0}',
-                LogStatusOn: '有効',
-                LogStatusOff: '無効',
-                LogQuickSet: '最大件数を設定しました:',
                 LogTimerRetry: 'タイマーが表示動画の過多を検出したため、制限を再実行します',
                 LogInitDone: 'BiliCompact 初期化完了（非侵入型）、現在の設定:',
                 LogInitError: '初期化に失敗:',
@@ -1691,49 +1729,59 @@ if (typeof module !== 'undefined' && module.exports) {
 
                 // Menu
                 MenuSettings: 'BiliCompact設定',
-                MenuRefresh: '簡素化を再実行',
-                MenuToggle: '簡素化のオン/オフ',
-                MenuQuickSet: '件数をすばやく設定',
-                MenuCommentPurifier: 'コメント浄化の切り替え',
-                MenuAccountJudge: 'アカウント判定の切り替え',
                 MenuAccountPanel: 'AI コメントパネル',
                 AccountPanelTitle: 'AI コメントパネル',
-                AccountPanelStat: 'このページに {0} アカウント、{1} コメント：確定 {2}、疑わしい {3}',
-                AccountPanelEmpty: 'まだコメントを取得していません。メニューでアカウント判定をオンにして、コメント欄をスクロールしてください。',
+                AccountPanelStat: 'このページの {1} コメントのうち、かなり怪しい {2} 件、少し怪しい {3} 件',
                 AccountPanelClose: '閉じる',
                 AccountNoText: '（本文なし）',
-                AccountVerdictFish: '確定',
-                AccountVerdictSuspect: '疑わしい',
-                AccountVerdictHuman: '人間',
-                AccountActionFocus: '位置へ',
-                AccountActionHide: '非表示',
-                AccountActionRestore: '復元',
-                AccountActionMarkHuman: '人間として登録',
+                AccountVerdictFish: 'かなり怪しい',
+                AccountVerdictSuspect: '少し怪しい',
+                AccountVerdictHuman: '違う',
+                AccountActionFocus: '見に行く',
+                AccountActionHide: '隠す',
+                AccountActionRestore: '戻す',
+                AccountActionMarkHuman: '本物の人',
                 AccountHiddenTag: '非表示中',
                 AccountGoneTag: 'コメントはページから消えています',
                 AccountSettings: '設定',
                 AccountSettingEnabled: 'アカウント判定をオンにする',
-                AccountSettingThreshold: '判定の厳しさ',
+                AccountSettingThreshold: '判定のゆるさ',
                 AccountSettingWords: '追加の特徴語（1 行に 1 つ）',
                 AccountSettingWordsHint: 'ここで足した語は自分の判定にだけ効き、初期ルールは変わりません。',
                 PanelEnableAccountJudge: 'アカウント判定を有効化（コメント欄の AI ペットアカウント）',
+                PanelNormalizePunct: '句読点を口語に（セミコロン・コロン・ダッシュを読点へ）',
                 PanelAccountStatusOff: 'アカウント判定：オフ',
-                PanelAccountStatusOn: 'アカウント判定：オン、このページに {0} アカウント（確定 {1}、疑わしい {2}）',
+                PanelAccountStatusOn: 'アカウント判定：オン、このページで かなり怪しい {1} 件、少し怪しい {2} 件',
                 PanelOpenAccountPanel: 'AI コメントパネルを開く',
+                PanelCompactToggle: '簡素化の切り替え',
+                PanelCompactRefresh: '再整理',
+                PanelOneClickAuto: 'ワンクリック設定：かなり怪しい AI アカウントを自動で隠す',
+                PanelOneClickHint: 'アカウント判定をオンにし、判定のゆるさを標準にして、かなり怪しいものを自動で隠します。アカウント判定の項目だけを変更します。',
                 AccountWhiteTitle: '人間として登録済み',
                 AccountActionUnmark: '取り消す',
-                AccountActionHideConfirmed: '確定の {0} 件を非表示',
-                AccountActionHideAll: '疑わしい分も含めて非表示（{0} 件）',
-                AccountActionRestoreAll: 'すべて復元（{0} 件）',
-                AccountSettingAuto: '処理方法',
-                AccountAutoOff: '収集のみ（ページは変更しない）',
-                AccountAutoFish: '確定したものを自動で非表示',
-                AccountAutoBoth: '確定と疑わしいものを自動で非表示',
+                AccountActionHideConfirmed: '今後もこれで：かなり怪しい {0} 件を隠す',
+                AccountActionHideAll: '今後もこれで：少し怪しい分も隠す（{0} 件）',
+                AccountActionRestoreAll: 'すべて戻し、自動で隠さない（{0} 件）',
+                AccountSettingAuto: '見つけたらどうする',
+                AccountAutoOff: '見るだけ（ページは変えない）',
+                AccountAutoFish: 'かなり怪しいものを自動で隠す',
+                AccountAutoBoth: 'かなり怪しいものと少し怪しいものも隠す',
                 AccountAutoHint: '設定すると以降の動画でも自動で行い、オンにした時点のページにも反映します。',
-                AccountToolbarHint: '上のボタンは「処理方法」も変更します：非表示はその設定を記憶し、すべて復元は収集のみに戻します。',
+                AccountToolbarHint: '上のボタンの選択は記憶され、以降の動画にも適用されます。',
+                AccountThresholdLoose: 'ゆるい',
+                AccountThresholdNormal: '標準',
+                AccountThresholdStrict: 'きつい',
+                AccountGuideTitle: 'まだ始まっていません',
+                AccountGuideBody: 'オンにすると、このページのコメントのアカウントを一つずつ見て、自動アカウントらしいものを拾います。ページの見た目は変わりません。',
+                AccountGuideStart: 'チェックを始める',
+                AccountGuideAuto: '始めて、かなり怪しいものを自動で隠す',
+                AccountGuideNote: '設定からいつでも戻せます。',
+                AccountPanelWaiting: 'コメントの読み込み待ちです。コメント欄までスクロールしてください。',
+                AccountShowDetails: '理由',
                 Reason_nicknameSuffix: '名前が「〇〇の魚 / 〇〇の鯨」',
                 Reason_nicknameFish: '名前に肥魚・鯨娘・人機などが入っている',
                 Reason_nicknameAi: '名前に AI・bot・デスクトップペットと書いてある',
+                Reason_nicknameModel: '名前に GPT や Claude などのモデル名が入っている',
                 Reason_customWord: '追加した特徴語に一致',
                 Reason_selfClaim: '「本鯨」「本魚」と名乗る',
                 Reason_masterMention: 'ご主人様やご飯係に触れる',
@@ -1747,6 +1795,7 @@ if (typeof module !== 'undefined' && module.exports) {
                 Reason_recap: '動画の要点・再生位置・弾幕回数を復唱している',
                 Reason_longText: '長い文章を一気に書いている',
                 Reason_humanQuestion: '本物の人間のように質問している',
+                Reason_substantive: '具体的な細部を挙げていて、実際に見たように読める',
                 Reason_humanSlang: '本物の人間のように突っ込んでいる',
                 Reason_levelNew: 'レベル 2 以下の新規アカウント',
                 Reason_levelSmall: 'レベル 3 のサブアカウント',
@@ -1754,8 +1803,6 @@ if (typeof module !== 'undefined' && module.exports) {
                 Reason_verified: '公式認証あり',
                 Reason_member: 'プレミアム会員に入っている',
                 Reason_repeat: 'このページで何度も書き込んでいる',
-                Reason_callout: '他の人に AI と指摘されている',
-                Reason_prior: '他のページでも判定済み',
                 Reason_upOwner: '動画の投稿者本人',
                 Reason_toolCall: '本文にツール呼び出しの生データが漏れている',
 
@@ -1818,7 +1865,6 @@ if (typeof module !== 'undefined' && module.exports) {
                 RmSpaceNotif: 'スペース-お知らせ',
 
                 // Prompt
-                PromptQuickSet: '表示する最大動画数を入力してください（1-100）：',
             }
         };
     
@@ -1877,6 +1923,7 @@ if (typeof module !== 'undefined' && module.exports) {
             CommentRegex: [],          // 评论屏蔽正则（去空白后部分匹配）
             SubstituteWords: [],       // 替换规则 [{find, replace, scopes:['content'|'emoticon']}]
             RegexReplaceWords: [],     // 正则替换规则 [{find, replace, scopes:['regex']}]（直接匹配原文，空替换=删除）
+            NormalizePunctuation: true, // 标点改口语：分号冒号破折号换成逗号，默认开
             EnableReplacement: false,  // 评论内容替换总开关
             ClearCommentEmoticons: false, // 清除评论中全部表情
             ReplaceCommentSearchTerms: false, // 搜索跳转关键词转普通文本
@@ -2033,10 +2080,10 @@ if (typeof module !== 'undefined' && module.exports) {
                 } catch (_) {}
             }
 
-            // 2. 删除所有 @提及标签（原有行为；必须先于搜索词替换，否则会被 a→span 一并吞掉）
-            const mentions = contents.querySelectorAll('a[data-type="mention"]');
-            for (const m of mentions) {
-                m.remove();
+            // 2. 删除所有 @提及标签（评论净化器自己的行为；必须先于搜索词替换，否则会被 a→span 一并吞掉）
+            if (Config.EnableCommentPurifier) {
+                const mentions = contents.querySelectorAll('a[data-type="mention"]');
+                for (const m of mentions) m.remove();
             }
 
             // 3. 内容替换（对齐 Blocker: 表情 → 搜索词 → 关键词；替换元素打 replace 标记防重）
@@ -2096,11 +2143,23 @@ if (typeof module !== 'undefined' && module.exports) {
                 }
             }
 
+            // 3e. 标点改口语：独立于内容替换总开关，开关在配置面板
+            if (Config.NormalizePunctuation) {
+                contents.querySelectorAll('span').forEach(function(Span) {
+                    if (Span.getAttribute('replace') !== null) return;
+                    const OldText = Span.textContent || '';
+                    const R = CommentRuleEngine.replaceRegex(PUNCT_RULES, OldText);
+                    if (!R.state) return;
+                    Span.textContent = R.content;
+                    Span.setAttribute('replace', '');
+                });
+            }
+
             // 4. 计算剩余有效字符（原有行为）
             const remaining = contents.textContent.replace(/\s+/g, '').trim();
 
-            // 不足5字 -> 隐藏整条评论（原有行为）
-            if (remaining.length < 5) {
+            // 不足5字 -> 隐藏整条评论（评论净化器自己的行为）
+            if (Config.EnableCommentPurifier && remaining.length < 5) {
                 renderer.style.display = 'none';
                 try {
                     const threadRenderer = renderer.getRootNode().host;
@@ -2154,7 +2213,7 @@ if (typeof module !== 'undefined' && module.exports) {
          * - 首次扫描零延迟；检测到 Blocker 只在日志中标记，不影响流程
          */
         function startCommentPurifier() {
-            if (!Config.EnableCommentPurifier) return;
+            if (!Config.EnableCommentPurifier && !Config.NormalizePunctuation) return;
             if (PurifierStarted) return;
             PurifierStarted = true;
     
@@ -2690,19 +2749,44 @@ if (typeof module !== 'undefined' && module.exports) {
             Head.appendChild(Tag);
             Row.appendChild(Head);
 
+            // 默认只露最重的一条理由和第一条正文，其余收进「为什么」，
+            // 免得一屏全是字，用户要滚很久才看得到下一个账号
+            const AllReasons = RowData.verdict.reasons
+                .filter(R => R.w !== 0)
+                .map(R => T('Reason_' + R.code));
+
             const Why = document.createElement('div');
             Why.className = 'bc-hint';
-            Why.textContent = RowData.verdict.reasons
-                .filter(R => R.w !== 0)
-                .map(R => T('Reason_' + R.code))
-                .join(' · ');
+            Why.textContent = AllReasons[0] || '';
             Row.appendChild(Why);
 
-            for (const Text of RowData.texts.slice(0, 3)) {
+            const FirstText = document.createElement('div');
+            FirstText.className = 'bc-hint';
+            FirstText.textContent = shortenText(RowData.texts[0], 120) || T('AccountNoText');
+            Row.appendChild(FirstText);
+
+            const More = document.createElement('div');
+            More.style.display = 'none';
+            for (const Reason of AllReasons.slice(1)) {
+                const Line = document.createElement('div');
+                Line.className = 'bc-hint';
+                Line.textContent = Reason;
+                More.appendChild(Line);
+            }
+            for (const Text of RowData.texts.slice(1, 3)) {
                 const Line = document.createElement('div');
                 Line.className = 'bc-hint';
                 Line.textContent = shortenText(Text, 120) || T('AccountNoText');
-                Row.appendChild(Line);
+                More.appendChild(Line);
+            }
+            Row.appendChild(More);
+
+            if (AllReasons.length > 1 || RowData.texts.length > 1) {
+                const Toggle = panelButton(T('AccountShowDetails'), function() {
+                    More.style.display = More.style.display === 'none' ? '' : 'none';
+                });
+                Toggle.style.alignSelf = 'flex-start';
+                Row.appendChild(Toggle);
             }
 
             const Actions = document.createElement('div');
@@ -2727,6 +2811,55 @@ if (typeof module !== 'undefined' && module.exports) {
             Row.appendChild(Actions);
 
             return Row;
+        }
+
+        /** 还没开启时的引导页：一个按钮就够，不让用户去找设置 */
+        function renderAccountGuide(Panel) {
+            Panel.innerHTML = '';
+
+            const Title = document.createElement('h3');
+            Title.textContent = T('AccountGuideTitle');
+            Panel.appendChild(Title);
+
+            const Body = document.createElement('div');
+            Body.className = 'bc-hint';
+            Body.style.margin = '6px 0 12px';
+            Body.textContent = T('AccountGuideBody');
+            Panel.appendChild(Body);
+
+            const Start = panelButton(T('AccountGuideStart'), function() {
+                Config.EnableAccountJudge = true;
+                SaveConfig({ EnableAccountJudge: true });
+                startAccountJudge();
+                renderAccountPanel();
+            });
+            Start.className = 'bc-btn bc-btn-accent';
+            Panel.appendChild(Start);
+
+            const Auto = panelButton(T('AccountGuideAuto'), function() {
+                Config.EnableAccountJudge = true;
+                Config.AccountJudgeAuto = 'fish';
+                Config.AccountJudgeThreshold = AccountJudge.thresholdFor('normal');
+                SaveConfig({
+                    EnableAccountJudge: true,
+                    AccountJudgeAuto: 'fish',
+                    AccountJudgeThreshold: Config.AccountJudgeThreshold
+                });
+                startAccountJudge();
+                renderAccountPanel();
+            });
+            Auto.style.marginLeft = '8px';
+            Panel.appendChild(Auto);
+
+            const Note = document.createElement('div');
+            Note.className = 'bc-hint';
+            Note.style.marginTop = '10px';
+            Note.textContent = T('AccountGuideNote');
+            Panel.appendChild(Note);
+
+            const Close = panelButton(T('AccountPanelClose'), closeAccountPanel);
+            Close.style.marginTop = '12px';
+            Panel.appendChild(Close);
         }
 
         /** 一键操作的工具栏：屏蔽确认的、连可疑一起屏蔽、恢复全部 */
@@ -2827,21 +2960,22 @@ if (typeof module !== 'undefined' && module.exports) {
             Body.appendChild(EnabledRow);
 
             const ThresholdRow = document.createElement('label');
-            const Threshold = document.createElement('input');
-            Threshold.type = 'number';
-            Threshold.min = '30';
-            Threshold.max = '90';
-            Threshold.step = '5';
-            Threshold.value = String(Config.AccountJudgeThreshold);
-            Threshold.style.width = '64px';
+            const Threshold = document.createElement('select');
+            for (const Opt of [
+                { value: 'loose', label: T('AccountThresholdLoose') },
+                { value: 'normal', label: T('AccountThresholdNormal') },
+                { value: 'strict', label: T('AccountThresholdStrict') }
+            ]) {
+                const Item = document.createElement('option');
+                Item.value = Opt.value;
+                Item.textContent = Opt.label;
+                if (AccountJudge.thresholdName(Config.AccountJudgeThreshold) === Opt.value) Item.selected = true;
+                Threshold.appendChild(Item);
+            }
             Threshold.addEventListener('change', function() {
-                const Value = parseInt(Threshold.value, 10);
-                if (!(Value >= 30 && Value <= 90)) {
-                    Threshold.value = String(Config.AccountJudgeThreshold);
-                    return;
-                }
-                Config.AccountJudgeThreshold = Value;
-                SaveConfig({ AccountJudgeThreshold: Value });
+                Config.AccountJudgeThreshold = AccountJudge.thresholdFor(Threshold.value);
+                SaveConfig({ AccountJudgeThreshold: Config.AccountJudgeThreshold });
+                accountApply();
                 renderAccountPanel();
             });
             ThresholdRow.appendChild(document.createTextNode(T('AccountSettingThreshold') + ' '));
@@ -2923,6 +3057,11 @@ if (typeof module !== 'undefined' && module.exports) {
         function renderAccountPanel() {
             const Panel = AccountPanelHandle && AccountPanelHandle.el;
             if (!Panel) return;
+            if (!Config.EnableAccountJudge) {
+                renderAccountGuide(Panel);
+                return;
+            }
+
             const All = accountRows();
             const Total = All.reduce(function(N, R) { return N + R.count; }, 0);
             const Confirmed = All.filter(R => R.verdict.level === 'fish').length;
@@ -2949,7 +3088,7 @@ if (typeof module !== 'undefined' && module.exports) {
             if (!Rows.length) {
                 const Empty = document.createElement('div');
                 Empty.className = 'bc-hint';
-                Empty.textContent = T('AccountPanelEmpty');
+                Empty.textContent = T('AccountPanelWaiting');
                 Panel.appendChild(Empty);
             } else {
                 const List = document.createElement('div');
@@ -3751,6 +3890,8 @@ if (typeof module !== 'undefined' && module.exports) {
                 <div class="StatusRow">
                     <span>${T('PanelStatusLabel')}</span>
                     <span class="StatusBadge ${IsActive ? '' : 'Off'}" id="CfgStatusBadge">${IsActive ? T('PanelStatusActive') : T('PanelStatusPaused')}</span>
+                    <button class="bc-btn" id="CfgToggleCompact">${T('PanelCompactToggle')}</button>
+                    <button class="bc-btn" id="CfgRefreshCompact">${T('PanelCompactRefresh')}</button>
                 </div>
                 <label>${T('PanelMaxVideos')} <input type="number" id="CfgMax" value="${Config.MaxVideos}" min="1" max="100"></label>
                 <label>${T('PanelExcludeLive')} <input type="checkbox" id="CfgExcludeLive" ${Config.ExcludeLive ? 'checked' : ''}></label>
@@ -3760,10 +3901,15 @@ if (typeof module !== 'undefined' && module.exports) {
                 <label>${T('PanelKeepPromoted')} <input type="checkbox" id="CfgKeepPromoted" ${Config.KeepPromoted ? 'checked' : ''}></label>
                 <label>${T('PanelDebug')} <input type="checkbox" id="CfgDebug" ${Config.Debug ? 'checked' : ''}></label>
                 <label>${T('PanelEnableCommentPurifier')} <input type="checkbox" id="CfgEnablePurifier" ${Config.EnableCommentPurifier ? 'checked' : ''}></label>
+                <label>${T('PanelNormalizePunct')} <input type="checkbox" id="CfgNormalizePunct" ${Config.NormalizePunctuation ? 'checked' : ''}></label>
                 <label>${T('PanelEnableAccountJudge')} <input type="checkbox" id="CfgEnableAccountJudge" ${Config.EnableAccountJudge ? 'checked' : ''}></label>
                 <div style="display:flex;align-items:center;gap:8px;padding:0 2px 6px">
                     <span class="bc-hint" style="flex:1">${accountStatusText()}</span>
                     <button class="bc-btn" id="CfgOpenAccountPanel">${T('PanelOpenAccountPanel')}</button>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:2px;padding:0 2px 8px">
+                    <button class="bc-btn bc-btn-accent" id="CfgOneClickAuto" style="align-self:flex-start">${T('PanelOneClickAuto')}</button>
+                    <span class="bc-hint">${T('PanelOneClickHint')}</span>
                 </div>
                 <label>${T('PanelLanguage')} <select id="CfgLanguage">${LangSelectHTML}</select></label>
                 <label>${T('PanelColorMode')} <select id="CfgColorMode">
@@ -3847,6 +3993,40 @@ if (typeof module !== 'undefined' && module.exports) {
                 openAccountPanel();
             });
 
+            document.getElementById('CfgToggleCompact').addEventListener('click', function() {
+                IsActive = !IsActive;
+                const Badge = document.getElementById('CfgStatusBadge');
+                if (IsActive) {
+                    LimitVideos();
+                } else {
+                    RestoreAllVideos();
+                }
+                Badge.textContent = IsActive ? T('PanelStatusActive') : T('PanelStatusPaused');
+                Badge.className = 'StatusBadge' + (IsActive ? '' : ' Off');
+            });
+
+            document.getElementById('CfgRefreshCompact').addEventListener('click', function() {
+                EffectiveSelector = null;
+                VideoListContainer = null;
+                LimitVideos();
+            });
+
+            // 傻瓜按钮：只动账号识别相关的三项，别的设置一概不碰
+            document.getElementById('CfgOneClickAuto').addEventListener('click', function() {
+                Config.EnableAccountJudge = true;
+                Config.AccountJudgeThreshold = AccountJudge.thresholdFor('normal');
+                Config.AccountJudgeAuto = 'fish';
+                SaveConfig({
+                    EnableAccountJudge: true,
+                    AccountJudgeThreshold: Config.AccountJudgeThreshold,
+                    AccountJudgeAuto: 'fish'
+                });
+                document.getElementById('CfgEnableAccountJudge').checked = true;
+                startAccountJudge();
+                CloseConfigPanel();
+                openAccountPanel();
+            });
+
             document.getElementById('CfgSave').addEventListener('click', function() {
                 const Max = parseInt(document.getElementById('CfgMax').value) || 10;
                 const NewLang = document.getElementById('CfgLanguage').value;
@@ -3864,6 +4044,7 @@ if (typeof module !== 'undefined' && module.exports) {
                     KeepSpecialUPIDs: document.getElementById('CfgKeepUids').value.split(',').map(S => S.trim()).filter(Boolean).map(Number),
                     Debug: document.getElementById('CfgDebug').checked,
                     EnableCommentPurifier: document.getElementById('CfgEnablePurifier').checked,
+                    NormalizePunctuation: document.getElementById('CfgNormalizePunct').checked,
                     EnableAccountJudge: document.getElementById('CfgEnableAccountJudge').checked,
                     RemovedElements: (function() {
                         var obj = {};
@@ -3906,9 +4087,10 @@ if (typeof module !== 'undefined' && module.exports) {
                 LimitVideos();
                 applyElementRemoval();
     
-                // 评论净化器开关变更后立即启停
-                if (NewConfig.EnableCommentPurifier) {
+                // 评论净化器与标点改口语任一开启就要跑扫描，都关掉才停
+                if (NewConfig.EnableCommentPurifier || NewConfig.NormalizePunctuation) {
                     startCommentPurifier();
+                    purifierRescanAll();
                 } else {
                     stopCommentPurifier();
                 }
@@ -3939,6 +4121,7 @@ if (typeof module !== 'undefined' && module.exports) {
                 document.getElementById('CfgKeepPromoted').checked = Config.KeepPromoted;
                 document.getElementById('CfgDebug').checked = Config.Debug;
                 document.getElementById("CfgEnablePurifier").checked = false;
+                document.getElementById('CfgNormalizePunct').checked = DEFAULTS.NormalizePunctuation;
                 document.getElementById('CfgEnableReplacement').checked = false;
                 document.getElementById('CfgClearEmoticons').checked = false;
                 document.getElementById('CfgReplaceSearchTerms').checked = false;
@@ -4147,50 +4330,17 @@ if (typeof module !== 'undefined' && module.exports) {
         }
     
         // ======================== 菜单命令（唯一入口，在语言解析后注册） ========================
+        // 菜单只留两个入口：设置与 AI 评论面板。其余开关与动作都在面板里，
+        // 免得用户要先在油猴菜单里辨认一堆「切换 XX」。
         function RegisterMenu() {
             GM_registerMenuCommand(T('MenuSettings'), function() {
                 OpenConfigPanel();
             });
-            GM_registerMenuCommand(T('MenuRefresh'), function() {
-                EffectiveSelector = null;
-                VideoListContainer = null;
-                LimitVideos();
-            });
-            GM_registerMenuCommand(T('MenuToggle'), function() {
-                IsActive = !IsActive;
-                if (IsActive) {
-                    LimitVideos();
-                } else {
-                    RestoreAllVideos();
-                }
-                Log(T('LogStatus'), IsActive ? T('LogStatusOn') : T('LogStatusOff'));
-            });
-            GM_registerMenuCommand(T('MenuAccountJudge'), function() {
-                toggleAccountJudge();
-            });
             GM_registerMenuCommand(T('MenuAccountPanel'), function() {
                 openAccountPanel();
             });
-            GM_registerMenuCommand(T('MenuCommentPurifier'), function() {
-                toggleCommentPurifier();
-            });
-            GM_registerMenuCommand(T('MenuQuickSet'), function() {
-                const Num = prompt(T('PromptQuickSet'), Config.MaxVideos);
-                if (Num !== null) {
-                    const N = parseInt(Num);
-                    if (N >= 1 && N <= 100) {
-                        Config.MaxVideos = N;
-                        SaveConfig({ MaxVideos: N });
-                        if (!IsActive) {
-                            IsActive = true;
-                        }
-                        LimitVideos();
-                        Log(T('LogQuickSet'), N);
-                    }
-                }
-            });
         }
-    
+
         // ======================== 初始化 ========================
         function Init() {
             try {
@@ -4208,7 +4358,7 @@ if (typeof module !== 'undefined' && module.exports) {
                 // 注册菜单（TM菜单是唯一入口，不在页面注入UI）
                 RegisterMenu();
     
-                // 启动评论净化器（如果启用）
+                // 启动评论净化：屏蔽与替换归它管，标点改口语也靠这条扫描
                 startCommentPurifier();
 
                 // 启动账号识别（如果启用）
